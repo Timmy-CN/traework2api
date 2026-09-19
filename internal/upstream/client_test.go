@@ -5,8 +5,10 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"traework2api/internal/auth"
 )
@@ -266,5 +268,165 @@ func TestCheckinStatusAndClaim(t *testing.T) {
 	}
 	if path != EpCheckinStatus {
 		t.Errorf("path=%s", path)
+	}
+}
+
+// TestCheckinClaimBusinessError HTTP 200 + 业务码非零必须报错（回归：曾丢弃响应体误判成功）。
+func TestCheckinClaimBusinessError(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":1005,"message":"活动已结束"}`), nil
+	})
+	err := c.CheckinClaim(&auth.Auth{AccessToken: "at", UID: "u1"})
+	if err == nil {
+		t.Fatal("code!=0 with HTTP 200 must be an error, got nil")
+	}
+	var ce *CheckinError
+	if !errors.As(err, &ce) || ce.Code != 1005 {
+		t.Errorf("want CheckinError code=1005, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "活动已结束") {
+		t.Errorf("error should carry upstream message, got %v", err)
+	}
+}
+
+// TestCheckinClaimSuccessFalse HTTP 200 + success=false 也要报错。
+func TestCheckinClaimSuccessFalse(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"success":false,"msg":"risk control"}`), nil
+	})
+	if err := c.CheckinClaim(&auth.Auth{AccessToken: "at"}); err == nil {
+		t.Fatal("success=false must be an error")
+	}
+}
+
+// TestCheckinClaimSuccessFieldAbsent 字段缺失（非显式 false）不算失败。
+func TestCheckinClaimSuccessFieldAbsent(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"message":"ok"}`), nil
+	})
+	if err := c.CheckinClaim(&auth.Auth{AccessToken: "at"}); err != nil {
+		t.Fatalf("absent success field should not fail: %v", err)
+	}
+}
+
+// TestCheckinClaimRateLimitedRetry code=9074 应等一个重试间隔后重试，第二次成功。
+func TestCheckinClaimRateLimitedRetry(t *testing.T) {
+	calls := 0
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return jsonResp(200, `{"code":9074,"message":"too many requests"}`), nil
+		}
+		return jsonResp(200, `{"code":0,"message":"success"}`), nil
+	})
+	c.CheckinRetryDelay = time.Millisecond
+	if err := c.CheckinClaim(&auth.Auth{AccessToken: "at"}); err != nil {
+		t.Fatalf("retry should succeed: %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("claim calls=%d want 2", calls)
+	}
+}
+
+// TestCheckinClaimRateLimitedExhausted 连续 9074 时只重试一次并报错。
+func TestCheckinClaimRateLimitedExhausted(t *testing.T) {
+	calls := 0
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		calls++
+		return jsonResp(200, `{"code":9074,"message":"too many requests"}`), nil
+	})
+	c.CheckinRetryDelay = time.Millisecond
+	err := c.CheckinClaim(&auth.Auth{AccessToken: "at"})
+	if err == nil {
+		t.Fatal("persistent 9074 should fail")
+	}
+	var ce *CheckinError
+	if !errors.As(err, &ce) || ce.Code != CodeCheckinRateLimited {
+		t.Errorf("want rate-limit CheckinError, got %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("should retry exactly once, calls=%d", calls)
+	}
+}
+
+// TestDailyCheckinVerifiesClaim claim 返回 200 但复核仍未签到 → 必须报错。
+func TestDailyCheckinVerifiesClaim(t *testing.T) {
+	statusCalls := 0
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, EpCheckinClaim):
+			return jsonResp(200, `{"code":0,"message":"success"}`), nil
+		default:
+			statusCalls++
+			return jsonResp(200, `{"checked_in":false,"credits":200,"enable":true}`), nil
+		}
+	})
+	err := c.DailyCheckin(&auth.Auth{AccessToken: "at", UID: "u1"})
+	if err == nil {
+		t.Fatal("claim accepted but still unchecked must fail verification")
+	}
+	if !strings.Contains(err.Error(), "verification failed") {
+		t.Errorf("want verification error, got %v", err)
+	}
+	if statusCalls != 2 {
+		t.Errorf("status calls=%d want 2 (pre-check + verify)", statusCalls)
+	}
+}
+
+// TestDailyCheckinSuccess claim 后复核为已签 → 成功。
+func TestDailyCheckinSuccess(t *testing.T) {
+	checked := false
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, EpCheckinClaim):
+			checked = true
+			return jsonResp(200, `{"code":0,"message":"success"}`), nil
+		default:
+			return jsonResp(200, `{"checked_in":`+strconv.FormatBool(checked)+`,"credits":200,"enable":true}`), nil
+		}
+	})
+	if err := c.DailyCheckin(&auth.Auth{AccessToken: "at"}); err != nil {
+		t.Fatalf("daily checkin: %v", err)
+	}
+}
+
+// TestDailyCheckinAlready 已签到返回哨兵错误，且不再调用 claim。
+func TestDailyCheckinAlready(t *testing.T) {
+	claimCalls := 0
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, EpCheckinClaim) {
+			claimCalls++
+		}
+		return jsonResp(200, `{"checked_in":true,"credits":200,"enable":true}`), nil
+	})
+	err := c.DailyCheckin(&auth.Auth{AccessToken: "at"})
+	if !errors.Is(err, ErrAlreadyCheckedIn) {
+		t.Fatalf("want ErrAlreadyCheckedIn, got %v", err)
+	}
+	if !IsAlreadyCheckedIn(err) {
+		t.Error("IsAlreadyCheckedIn should accept sentinel")
+	}
+	if claimCalls != 0 {
+		t.Errorf("already checked in should skip claim, calls=%d", claimCalls)
+	}
+}
+
+// TestDailyCheckinDisabled 活动未开启 → ErrCheckinDisabled。
+func TestDailyCheckinDisabled(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"checked_in":false,"credits":0,"enable":false}`), nil
+	})
+	if err := c.DailyCheckin(&auth.Auth{AccessToken: "at"}); !errors.Is(err, ErrCheckinDisabled) {
+		t.Fatalf("want ErrCheckinDisabled, got %v", err)
+	}
+}
+
+// TestCheckinStatusBusinessError status 接口的业务失败同样要报错。
+func TestCheckinStatusBusinessError(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":20101,"msg":"login required"}`), nil
+	})
+	if _, _, _, err := c.CheckinStatus(&auth.Auth{AccessToken: "at"}); err == nil {
+		t.Fatal("status code!=0 must be an error")
 	}
 }

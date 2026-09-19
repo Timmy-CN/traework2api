@@ -5,6 +5,7 @@ package upstream
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +15,53 @@ import (
 
 	"traework2api/internal/auth"
 )
+
+// 签到业务错误哨兵。上游签到接口用 HTTP 200 + body 里的 code/message 表达失败，
+// 调用方需要区分「今天已签过」（视为成功）和「真的失败」。
+var (
+	// ErrAlreadyCheckedIn 今日已签到。
+	ErrAlreadyCheckedIn = errors.New("already checked in")
+	// ErrCheckinDisabled 该账号签到活动未开启。
+	ErrCheckinDisabled = errors.New("checkin disabled")
+)
+
+// CheckinError 签到接口的业务错误（HTTP 200 但 code != 0 或 success == false）。
+type CheckinError struct {
+	Code int    // 上游业务码；0 表示无 code 字段，仅 success=false
+	Msg  string // 上游 message/msg
+}
+
+func (e *CheckinError) Error() string {
+	if e.Msg == "" {
+		return fmt.Sprintf("checkin business error code=%d", e.Code)
+	}
+	return fmt.Sprintf("checkin business error code=%d msg=%s", e.Code, e.Msg)
+}
+
+// IsAlreadyCheckedIn 判定错误是否表示「今日已签到」。
+// 优先用哨兵判定；同时对上游文案兜底（不同版本返回中文/英文提示）。
+func IsAlreadyCheckedIn(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrAlreadyCheckedIn) {
+		return true
+	}
+	var ce *CheckinError
+	if errors.As(err, &ce) {
+		return containsAlreadyMarker(ce.Msg)
+	}
+	return containsAlreadyMarker(err.Error())
+}
+
+// containsAlreadyMarker 仅匹配明确表示「今日已签到」的标记，避免 429/5xx 等
+// 响应体里偶然出现 "checkin" 字样被误判。
+func containsAlreadyMarker(msg string) bool {
+	s := strings.ToLower(msg)
+	return strings.Contains(msg, "已签到") ||
+		strings.Contains(s, "already check") ||
+		strings.Contains(s, "already signed")
+}
 
 // ErrKind 错误分类，pool 据此决定冷却时长（SPEC §4.3）。
 type ErrKind int
@@ -104,6 +152,9 @@ type Client struct {
 	UgHost    string // https://api.trae.cn
 	OAuthHost string // https://api.trae.com.cn
 	ClientID  string // en1oxy7wnw8j9n
+
+	// CheckinRetryDelay 签到业务码 9074（限流）后的重试等待；0 表示不重试。
+	CheckinRetryDelay time.Duration
 }
 
 // New 生产默认值。配置连接池减少 TLS 握手。
@@ -115,12 +166,13 @@ func New() *Client {
 		ResponseHeaderTimeout: 120 * time.Second, // 首字节兜底（长推理预留），不限制整流时长
 	}
 	return &Client{
-		HTTP:       &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		StreamHTTP: &http.Client{Transport: tr}, // 无总超时
-		AgentHost:  AgentHost,
-		UgHost:     UgHost,
-		OAuthHost:  OAuthHost,
-		ClientID:   ClientID,
+		HTTP:              &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		StreamHTTP:        &http.Client{Transport: tr}, // 无总超时
+		AgentHost:         AgentHost,
+		UgHost:            UgHost,
+		OAuthHost:         OAuthHost,
+		ClientID:          ClientID,
+		CheckinRetryDelay: 8 * time.Second,
 	}
 }
 
@@ -319,7 +371,39 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	return out, nil
 }
 
-// CheckinStatus 查询签到状态。
+// checkinResp 签到 status/claim 的公共响应字段。
+// 上游失败时仍返回 HTTP 200，错误只体现在 code / success / message 里，
+// 因此必须解析 body，不能只看状态码。
+type checkinResp struct {
+	CheckedIn bool   `json:"checked_in"`
+	Credits   int64  `json:"credits"`
+	Enable    bool   `json:"enable"`
+	Code      int    `json:"code"`
+	Message   string `json:"message"`
+	Msg       string `json:"msg"`
+	Success   *bool  `json:"success"` // 指针区分「字段缺失」与显式 false
+}
+
+// text 返回上游文案（message 优先，兼容 msg）。
+func (r checkinResp) text() string {
+	if s := strings.TrimSpace(r.Message); s != "" {
+		return s
+	}
+	return strings.TrimSpace(r.Msg)
+}
+
+// businessErr 按业务字段判定失败；无业务错误时返回 nil。
+func (r checkinResp) businessErr() error {
+	if r.Code != 0 {
+		return &CheckinError{Code: r.Code, Msg: r.text()}
+	}
+	if r.Success != nil && !*r.Success {
+		return &CheckinError{Code: 0, Msg: r.text()}
+	}
+	return nil
+}
+
+// CheckinStatus 查询签到状态。业务码非零或 success=false 时返回错误。
 func (c *Client) CheckinStatus(a *auth.Auth) (checkedIn bool, credits int64, enable bool, err error) {
 	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinStatus, bytes.NewReader([]byte("{}")))
 	if err != nil {
@@ -328,28 +412,89 @@ func (c *Client) CheckinStatus(a *auth.Auth) (checkedIn bool, credits int64, ena
 	UgHeaders(req, a)
 	data, err := c.doJSON(req)
 	if err != nil {
+		log.Printf("checkin status uid=%s: %v", a.UID, err)
 		return false, 0, false, err
 	}
-	var resp struct {
-		CheckedIn bool  `json:"checked_in"`
-		Credits   int64 `json:"credits"`
-		Enable    bool  `json:"enable"`
-	}
+	var resp checkinResp
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return false, 0, false, fmt.Errorf("checkin status parse: %w", err)
+		err = fmt.Errorf("checkin status parse: %w", err)
+		log.Printf("checkin status uid=%s: %v", a.UID, err)
+		return false, 0, false, err
 	}
+	if berr := resp.businessErr(); berr != nil {
+		log.Printf("checkin status uid=%s: %v", a.UID, berr)
+		return false, 0, false, berr
+	}
+	log.Printf("checkin status uid=%s checked_in=%t credits=%d enable=%t",
+		a.UID, resp.CheckedIn, resp.Credits, resp.Enable)
 	return resp.CheckedIn, resp.Credits, resp.Enable, nil
 }
 
 // CheckinClaim 执行签到。
+// 解析业务码：code 非零或 success=false 一律返回错误；code=9074 是限流，
+// 等 CheckinRetryDelay 后重试一次。返回 nil 只表示「上游接受了本次请求」，
+// 是否真正签到成功由 DailyCheckin 的二次 status 复核裁决。
 func (c *Client) CheckinClaim(a *auth.Auth) error {
-	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinClaim, bytes.NewReader([]byte("{}")))
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinClaim, bytes.NewReader([]byte("{}")))
+		if err != nil {
+			return err
+		}
+		UgHeaders(req, a)
+		data, err := c.doJSON(req)
+		if err != nil {
+			log.Printf("checkin claim uid=%s: %v", a.UID, err)
+			return err
+		}
+		var resp checkinResp
+		if err := json.Unmarshal(data, &resp); err != nil {
+			err = fmt.Errorf("checkin claim parse: %w", err)
+			log.Printf("checkin claim uid=%s: %v", a.UID, err)
+			return err
+		}
+		if resp.Code == CodeCheckinRateLimited && attempt == 0 && c.CheckinRetryDelay > 0 {
+			log.Printf("checkin claim uid=%s: rate limited (code=%d), retry after %s",
+				a.UID, resp.Code, c.CheckinRetryDelay)
+			time.Sleep(c.CheckinRetryDelay)
+			continue
+		}
+		if berr := resp.businessErr(); berr != nil {
+			log.Printf("checkin claim uid=%s: %v", a.UID, berr)
+			return berr
+		}
+		log.Printf("checkin claim uid=%s accepted code=%d msg=%s", a.UID, resp.Code, resp.text())
+		return nil
+	}
+}
+
+// DailyCheckin 完整签到：查状态 → （未签则）claim → 复核状态。
+// 以二次 status 的 checked_in 为最终结论，避免「claim 返回 200 但实际没签上」。
+// 已签到时返回 ErrAlreadyCheckedIn，未开启活动返回 ErrCheckinDisabled。
+func (c *Client) DailyCheckin(a *auth.Auth) error {
+	checkedIn, _, enable, err := c.CheckinStatus(a)
 	if err != nil {
 		return err
 	}
-	UgHeaders(req, a)
-	_, err = c.doJSON(req)
-	return err
+	if checkedIn {
+		return ErrAlreadyCheckedIn
+	}
+	if !enable {
+		return ErrCheckinDisabled
+	}
+	if err := c.CheckinClaim(a); err != nil {
+		return err
+	}
+	verified, _, _, err := c.CheckinStatus(a)
+	if err != nil {
+		return fmt.Errorf("checkin verification: %w", err)
+	}
+	if !verified {
+		err := fmt.Errorf("checkin verification failed: checked_in=false after claim")
+		log.Printf("checkin verify uid=%s: %v", a.UID, err)
+		return err
+	}
+	log.Printf("checkin verified uid=%s", a.UID)
+	return nil
 }
 
 // UserEntUsage 聚合积分（ide_user_ent_usage 的 credits_limit 求和）。

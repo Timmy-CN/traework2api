@@ -74,36 +74,20 @@ func main() {
 			_ = a.SaveAtomic()
 		}
 
-		// 签到
-		checkedIn, _, enable, serr := up.CheckinStatus(a)
-		switch {
-		case serr != nil:
-			if isAlready(serr.Error()) {
-				r.status = "ALREADY"
-				r.detail = short(serr.Error())
-				alreadyN++
-			} else {
-				r.status = "FAIL"
-				r.detail = short(serr.Error())
-				failN++
-			}
-		case checkedIn:
+		// 签到闭环：status → claim → status 复核。
+		// 已签到不算失败；HTTP 200 但业务失败的响应不再被误判为成功。
+		switch err := up.DailyCheckin(a); {
+		case err == nil:
+			r.status = "OK"
+			okN++
+		case upstream.IsAlreadyCheckedIn(err):
 			r.status = "ALREADY"
-			r.detail = "already checked in"
+			r.detail = short(err.Error())
 			alreadyN++
-		case !enable:
-			r.status = "FAIL"
-			r.detail = "checkin disabled"
-			failN++
 		default:
-			if err := up.CheckinClaim(a); err != nil {
-				r.status = "FAIL"
-				r.detail = short(err.Error())
-				failN++
-			} else {
-				r.status = "OK"
-				okN++
-			}
+			r.status = "FAIL"
+			r.detail = short(err.Error())
+			failN++
 		}
 		// 查积分
 		if remain, qerr := up.UserEntUsage(a); qerr == nil {
@@ -124,15 +108,6 @@ func main() {
 			trunc(r.uid, 36), trunc(r.nick, 11), r.status, remain, r.detail)
 	}
 	fmt.Printf("\ntotal=%d ok=%d already=%d fail=%d\n", len(rows), okN, alreadyN, failN)
-}
-
-// isAlready 已签判定：仅匹配明确表示"今日已签到"的业务错误。
-// 只用无歧义标记，避免 429/5xx body 含 "checkin" 字样被误判为已签。
-func isAlready(msg string) bool {
-	s := strings.ToLower(msg)
-	return strings.Contains(s, "已签到") ||
-		strings.Contains(s, "already check") ||
-		strings.Contains(s, "already checked")
 }
 
 func trunc(s string, n int) string {

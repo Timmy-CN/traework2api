@@ -22,4 +22,7 @@ const (
 	EpCheckinStatus = "/trae/api/v2/ug/checkin_credits/status"
 	EpCheckinClaim  = "/trae/api/v2/ug/checkin_credits/claim"
 	EpEntUsage      = "/trae/api/v2/pay/ide_user_ent_usage"
+
+	// CodeCheckinRateLimited 签到 claim 的限流业务码（HTTP 200 返回），可稍后重试。
+	CodeCheckinRateLimited = 9074
 )

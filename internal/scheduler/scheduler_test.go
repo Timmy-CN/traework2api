@@ -1,9 +1,12 @@
 package scheduler
 
 import (
+	"bytes"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -47,6 +50,11 @@ type fakeUpstream struct {
 	claimCalls     atomic.Int32
 	refreshCalls   atomic.Int32
 	resourceRemain int64
+	// checkedIn 模拟服务端签到状态：claim 成功后翻转 true，
+	// 让 DailyCheckin 的二次复核有真实语义（而不是恒定未签导致误报失败）。
+	checkedIn atomic.Bool
+	// claimBody 覆盖 claim 响应体（默认成功），用于构造业务失败场景。
+	claimBody string
 }
 
 func (f *fakeUpstream) server() *httptest.Server {
@@ -54,9 +62,18 @@ func (f *fakeUpstream) server() *httptest.Server {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/checkin_credits/status"):
 			f.checkinCalls.Add(1)
-			w.Write([]byte(`{"checked_in":false,"credits":200,"enable":true}`))
+			checked := "false"
+			if f.checkedIn.Load() {
+				checked = "true"
+			}
+			w.Write([]byte(`{"checked_in":` + checked + `,"credits":200,"enable":true}`))
 		case strings.HasSuffix(r.URL.Path, "/checkin_credits/claim"):
 			f.claimCalls.Add(1)
+			if f.claimBody != "" {
+				w.Write([]byte(f.claimBody))
+				return
+			}
+			f.checkedIn.Store(true)
 			w.Write([]byte(`{"code":0,"message":"success"}`))
 		case strings.HasSuffix(r.URL.Path, "/ide_user_ent_usage"):
 			w.Write([]byte(`{"is_credits_billing":true,"user_entitlement_pack_list":[{"entitlement_base_info":{"quota":{"credits_limit":` +
@@ -104,7 +121,8 @@ func TestRunCheckinReenablesCoolingAccount(t *testing.T) {
 
 	s := newTestScheduler(f, p, srv)
 	s.RunCheckinNow()
-	if f.checkinCalls.Load() != 1 {
+	// DailyCheckin：签到前 status + claim 后复核 status，共 2 次
+	if f.checkinCalls.Load() != 2 {
 		t.Errorf("checkin status calls=%d", f.checkinCalls.Load())
 	}
 	if f.claimCalls.Load() != 1 {
@@ -185,5 +203,31 @@ func TestRunRefreshSessionDeadDisables(t *testing.T) {
 	st, _ := p.Status("u1")
 	if !st.Disabled {
 		t.Errorf("should disable session-dead account: %+v", st)
+	}
+}
+
+// TestRunCheckinBusinessFailureNotOk 回归：claim 返回 HTTP 200 但业务失败时，
+// 不得再输出 "checkin ok"（曾因丢弃响应体把实际未签到误报为成功）。
+func TestRunCheckinBusinessFailureNotOk(t *testing.T) {
+	f := &fakeUpstream{claimBody: `{"code":1005,"message":"活动已结束"}`}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	s := newTestScheduler(f, p, srv)
+	s.RunCheckinNow()
+
+	logs := buf.String()
+	if strings.Contains(logs, "checkin u1: ok") {
+		t.Errorf("business failure must not be logged as ok:\n%s", logs)
+	}
+	if !strings.Contains(logs, "code=1005") {
+		t.Errorf("business failure should be logged with upstream code:\n%s", logs)
 	}
 }

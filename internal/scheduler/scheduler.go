@@ -97,18 +97,25 @@ func (s *Scheduler) RunCheckinNow() {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
-		// 签到（status → 未签到则 claim）
-		checkedIn, _, enable, err := s.cfg.Upstream.CheckinStatus(a)
-		if err != nil {
-			log.Printf("checkin status %s: %v", st.UID, err)
-		} else if !checkedIn && enable {
-			if err := s.cfg.Upstream.CheckinClaim(a); err != nil {
-				log.Printf("checkin claim %s: %v", st.UID, err)
-			} else {
-				log.Printf("checkin %s: ok", st.UID)
+		// 签到前兜底刷新：凌晨预刷新失败时，避免拿着过期 token 签到。
+		if a.NeedsRefresh(2 * time.Hour) {
+			if err := s.cfg.Upstream.RefreshToken(a); err != nil {
+				log.Printf("checkin refresh %s: %v", st.UID, err)
+			} else if err := a.SaveAtomic(); err != nil {
+				log.Printf("checkin refresh %s save: %v", st.UID, err)
 			}
-		} else if checkedIn {
+		}
+		// 签到闭环：status → claim → status 复核，以复核结果为最终结论。
+		// 已签到不算失败；claim 返回 200 但复核未签上会报错（HTTP 200 业务失败不再漏判）。
+		switch err := s.cfg.Upstream.DailyCheckin(a); {
+		case err == nil:
+			log.Printf("checkin %s: ok", st.UID)
+		case errors.Is(err, upstream.ErrAlreadyCheckedIn):
 			log.Printf("checkin %s: already checked in", st.UID)
+		case errors.Is(err, upstream.ErrCheckinDisabled):
+			log.Printf("checkin %s: disabled", st.UID)
+		default:
+			log.Printf("checkin %s: %v", st.UID, err)
 		}
 		// 查积分 + 解冻
 		remain, err := s.cfg.Upstream.UserEntUsage(a)
@@ -116,6 +123,7 @@ func (s *Scheduler) RunCheckinNow() {
 			log.Printf("ent-usage %s: %v", st.UID, err)
 			continue
 		}
+		log.Printf("ent-usage %s: remain=%d", st.UID, remain)
 		s.cfg.Pool.ReenableIfCredits(st.UID, remain)
 	}
 }

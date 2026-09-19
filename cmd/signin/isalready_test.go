@@ -1,26 +1,41 @@
 package main
 
-import "testing"
+import (
+	"errors"
+	"testing"
 
-func TestIsAlready(t *testing.T) {
+	"traework2api/internal/upstream"
+)
+
+// TestIsAlreadyCheckedIn 覆盖已签判定（逻辑在 upstream.IsAlreadyCheckedIn）。
+func TestIsAlreadyCheckedIn(t *testing.T) {
 	// 明确"已签到"标记 → true
-	if !isAlready("今日已签到") {
-		t.Error("已签到 should be true")
+	for _, msg := range []string{"今日已签到", "you have already checked in"} {
+		if !upstream.IsAlreadyCheckedIn(errors.New(msg)) {
+			t.Errorf("%q should be already", msg)
+		}
 	}
-	if !isAlready("you have already checked in") {
-		t.Error("already checked in should be true")
+	// CheckinError 携带已签文案 → true
+	if !upstream.IsAlreadyCheckedIn(&upstream.CheckinError{Code: 9095, Msg: "今日已签到"}) {
+		t.Error("CheckinError with 已签到 should be already")
+	}
+	// 哨兵错误 → true
+	if !upstream.IsAlreadyCheckedIn(upstream.ErrAlreadyCheckedIn) {
+		t.Error("sentinel ErrAlreadyCheckedIn should be already")
 	}
 	// 歧义/错误路径 → false（不误判为已签）
-	if isAlready("checkin service error") {
-		t.Error("checkin service error should NOT be already")
+	for _, msg := range []string{
+		"checkin service error",
+		"upstream 429: checkin rate limited",
+		"code=400 bad request",
+		"",
+	} {
+		if upstream.IsAlreadyCheckedIn(errors.New(msg)) {
+			t.Errorf("%q should NOT be already", msg)
+		}
 	}
-	if isAlready("upstream 429: checkin rate limited") {
-		t.Error("429 rate limit should NOT be already")
-	}
-	if isAlready("code=400 bad request") {
-		t.Error("code=400 should NOT be already (removed ambiguous marker)")
-	}
-	if isAlready("") {
-		t.Error("empty should be false")
+	// CheckinError 非已签文案 → false
+	if upstream.IsAlreadyCheckedIn(&upstream.CheckinError{Code: 1001, Msg: "internal error"}) {
+		t.Error("CheckinError with unrelated msg should NOT be already")
 	}
 }
