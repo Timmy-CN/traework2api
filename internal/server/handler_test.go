@@ -229,8 +229,8 @@ func TestModelsEndpoint(t *testing.T) {
 		t.Errorf("object=%v", resp["object"])
 	}
 	data := resp["data"].([]any)
-	if len(data) != 17 {
-		t.Errorf("models count=%d want 17 (static table with internal entries filtered)", len(data))
+	if len(data) != 20 {
+		t.Errorf("models count=%d want 20 (static table with internal entries filtered)", len(data))
 	}
 	found := false
 	for _, m := range data {
@@ -256,8 +256,9 @@ func TestModelsInternalEntriesFiltered(t *testing.T) {
 	var resp map[string]any
 	json.Unmarshal(rec.Body.Bytes(), &resp)
 	banned := map[string]bool{
-		"custom_model_placeholder": true, "custom_model_claude": true,
-		"browser_use_subagent": true, "explore_sub_agent_v13": true, "summary": true,
+		"custom_model_placeholder": true, "custom_model_claude": true, "custom_model_gpt-6": true,
+		"browser_use_subagent": true, "computer_use_subagent": true, "explore_sub_agent_v2": true,
+		"file_search_agent": true, "summary": true,
 	}
 	for _, m := range resp["data"].([]any) {
 		id := m.(map[string]any)["id"].(string)
@@ -278,8 +279,8 @@ func TestModelsShowInternalModels(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
 	var resp map[string]any
 	json.Unmarshal(rec.Body.Bytes(), &resp)
-	if len(resp["data"].([]any)) != 32 {
-		t.Errorf("models count=%d want 32 with ShowInternalModels", len(resp["data"].([]any)))
+	if len(resp["data"].([]any)) != 39 {
+		t.Errorf("models count=%d want 39 with ShowInternalModels", len(resp["data"].([]any)))
 	}
 }
 
@@ -293,13 +294,23 @@ func TestIsInternalModel(t *testing.T) {
 		{"glm-5.2", false, false},
 		{"glm-5-turbo", false, false},
 		{"Doubao-Seed-2.1-Pro", false, false},
-		{"", false, true},                          // 空名
-		{"custom_model_claude", false, true},       // 前缀兜底
-		{"claude-sonnet", true, true},              // is_custom_model 标记
-		{"browser_use_subagent", false, true},      // 子代理
-		{"Explore_Sub_Agent_v13", false, true},     // 子代理（大小写不敏感）
-		{"summary", false, true},                   // 摘要器
-		{"summarize-pro", false, false},            // summary 是整名匹配，前缀不算
+		{"", false, true},                       // 空名
+		{"custom_model_claude", false, true},    // 前缀兜底
+		{"claude-sonnet", true, true},           // is_custom_model 标记
+		{"browser_use_subagent", false, true},   // 子代理
+		{"Explore_Sub_Agent_v13", false, true},  // 子代理（大小写不敏感）
+		{"computer_use_subagent", false, true},  // 子代理
+		{"file_search_agent", false, true},      // 检索代理（_agent 后缀）
+		{"summary", false, true},                // 摘要器
+		{"fast_apply", false, true},             // 工具配置
+		{"fast_apply_new", false, true},         // 工具配置
+		{"input_optimization", false, true},     // 工具配置
+		{"title_generation", false, true},       // 工具配置
+		{"custom_claude-sonnet-4", false, true}, // custom_ 前缀（custom_model_ 之外）
+		{"custom_gemini-2.5-pro", false, true},  // 同上
+		{"summarize-pro", false, false},         // summary 是整名匹配，前缀不算
+		{"sagitta", false, false},               // 真实模型
+		{"qwen3.8-max", false, false},           // 真实模型
 	}
 	for _, c := range cases {
 		if got := isInternalModel(c.id, c.isCustom); got != c.want {

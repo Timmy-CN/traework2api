@@ -162,23 +162,28 @@ func (h *Handler) knownModel(model string) bool {
 	return false
 }
 
-// 静态 SOLO 模型表（SPEC P3：32 个 config_name，来自逆向报告；动态拉取失败时回退）。
+// 静态 SOLO 模型表（2026-09-19 实测 get_detail_param 快照，39 个全局 config_name；
+// 动态拉取失败时回退；不含账号级自定义模型，内部配置在响应时过滤）。
 var staticModels = []map[string]any{
+	{"id": "Doubao-Seed-Evolving", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "Doubao-Seed-2.1-Pro", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "seed-code-pro-0430", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "Doubao-Seed-2.1-Turbo", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
+	{"id": "computer_use_subagent", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "Doubao-Seed-2.0-Code", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
-	{"id": "DeepSeek-V4-Flash-Official", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "browser_use_subagent", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "glm-5-turbo", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "glm-5", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
-	{"id": "DeepSeek-V4-Pro", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
+	{"id": "DeepSeek-V4-Flash-Official", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "DeepSeek-V4-Flash", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
+	{"id": "DeepSeek-V4-Pro-Official", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
+	{"id": "DeepSeek-V4-Pro", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "kimi-k3", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "kimi-k2.7-code", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "kimi-k2.6", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "minimax-m3", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
+	{"id": "qwen3.8-max", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "qwen-3.7-plus", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "sagitta", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "aquila", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
@@ -186,14 +191,17 @@ var staticModels = []map[string]any{
 	{"id": "custom_model_placeholder", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "custom_model_1M_text", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "custom_model_1M", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
+	{"id": "custom_model_doubao_1M", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
+	{"id": "custom_model_doubao_256k", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "custom_model_kimi", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "custom_model_claude", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
+	{"id": "custom_model_gpt-6", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "custom_model_gpt-5", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "custom_model_no-fc", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "custom_model_deepseek_chat", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "custom_model_deepseek_reasoner", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "custom_model_deepseek_v4", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
-	{"id": "explore_sub_agent_v13", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
+	{"id": "file_search_agent", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "explore_sub_agent_v2", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "summary", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 }
@@ -244,12 +252,23 @@ func (h *Handler) modelList() []map[string]any {
 	return h.staticModelList()
 }
 
-// internalModelPrefix 第三方自定义代理模型前缀（需额外授权，不可直接对话）。
-const internalModelPrefix = "custom_model_"
+// internalModelPrefix 自定义代理模型前缀：custom_model_* 与 custom_<厂商>-<模型>
+// （第三方 provider 接入，需额外授权，不可直接对话）。
+const internalModelPrefix = "custom_"
+
+// internalModelNames 内部工具配置的精确名（非对话模型，不对外列出）。
+var internalModelNames = map[string]bool{
+	"summary":            true, // 摘要器
+	"title_generation":   true, // 标题生成
+	"input_optimization": true, // 输入优化
+	"fast_apply":         true, // 快速应用
+	"fast_apply_new":     true,
+}
 
 // isInternalModel 判定是否为不该在 /v1/models 暴露的内部模型配置：
-// 自定义代理（custom_model_* / is_custom_model）、内部子代理（*subagent*）
-// 与摘要器（summary）。官方客户端不会把它们当作可选模型展示。
+// 自定义代理（custom_* / is_custom_model）、内部子代理与检索代理
+// （*subagent* / *sub_agent* / *_agent）以及工具类配置（summary 等）。
+// 官方客户端不会把它们当作可选模型展示。
 func isInternalModel(id string, isCustom bool) bool {
 	name := strings.TrimSpace(id)
 	if name == "" {
@@ -258,11 +277,15 @@ func isInternalModel(id string, isCustom bool) bool {
 	if isCustom || strings.HasPrefix(name, internalModelPrefix) {
 		return true
 	}
-	if name == "summary" {
+	if internalModelNames[name] {
 		return true
 	}
 	lower := strings.ToLower(name)
-	return strings.Contains(lower, "subagent") || strings.Contains(lower, "sub_agent")
+	if strings.Contains(lower, "subagent") || strings.Contains(lower, "sub_agent") {
+		return true
+	}
+	// 内部子代理/检索代理：computer_use_subagent、file_search_agent 等
+	return strings.HasSuffix(lower, "_agent")
 }
 
 // visibleModels 过滤内部模型配置；ShowInternalModels 打开时原样返回。
