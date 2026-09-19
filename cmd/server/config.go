@@ -35,6 +35,10 @@ type Config struct {
 		TimeoutSeconds int `json:"timeout_seconds"` // 120
 	} `json:"upstream"`
 
+	// ShowInternalModels /v1/models 是否透出内部模型配置
+	// （custom_model_* / *subagent* / summary）；默认过滤。
+	ShowInternalModels bool `json:"show_internal_models"`
+
 	// 解析后的 duration。
 	PlanCreditDur  time.Duration `json:"-"`
 	SoftRateDur    time.Duration `json:"-"`
@@ -121,6 +125,12 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("TW2A_TIMEOUT_SECONDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Upstream.TimeoutSeconds = n
+		}
+	}
+	if v := os.Getenv("TW2A_SHOW_INTERNAL_MODELS"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			c.ShowInternalModels = true
 		}
 	}
 }

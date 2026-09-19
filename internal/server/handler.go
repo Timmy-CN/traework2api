@@ -28,6 +28,10 @@ type Config struct {
 	ErrCooldown  time.Duration // 错误冷却，默认 10m
 	RefreshSkew  time.Duration // token 预刷新窗口，默认 24h
 	DefaultModel string        // 默认 glm-5.2
+
+	// ShowInternalModels 在 /v1/models 透出内部模型配置
+	// （custom_model_* / *subagent* / summary）；默认过滤。
+	ShowInternalModels bool
 }
 
 // maxBodyBytes 请求体大小上限（8MB），超过返回 413。
@@ -217,8 +221,12 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 // modelList 动态获取模型列表并包装成 OpenAI 格式；失败回退静态表。
 func (h *Handler) modelList() []map[string]any {
 	if infos := h.fetchDynamicModels(); len(infos) > 0 {
-		out := make([]map[string]any, 0, len(infos))
-		for _, mi := range infos {
+		visible := h.visibleModels(infos)
+		if len(visible) == 0 {
+			visible = infos // 过滤后为空则不过滤，避免返回空列表
+		}
+		out := make([]map[string]any, 0, len(visible))
+		for _, mi := range visible {
 			entry := map[string]any{
 				"id":             mi.ID,
 				"object":         "model",
@@ -233,7 +241,61 @@ func (h *Handler) modelList() []map[string]any {
 		}
 		return out
 	}
-	return staticModels
+	return h.staticModelList()
+}
+
+// internalModelPrefix 第三方自定义代理模型前缀（需额外授权，不可直接对话）。
+const internalModelPrefix = "custom_model_"
+
+// isInternalModel 判定是否为不该在 /v1/models 暴露的内部模型配置：
+// 自定义代理（custom_model_* / is_custom_model）、内部子代理（*subagent*）
+// 与摘要器（summary）。官方客户端不会把它们当作可选模型展示。
+func isInternalModel(id string, isCustom bool) bool {
+	name := strings.TrimSpace(id)
+	if name == "" {
+		return true
+	}
+	if isCustom || strings.HasPrefix(name, internalModelPrefix) {
+		return true
+	}
+	if name == "summary" {
+		return true
+	}
+	lower := strings.ToLower(name)
+	return strings.Contains(lower, "subagent") || strings.Contains(lower, "sub_agent")
+}
+
+// visibleModels 过滤内部模型配置；ShowInternalModels 打开时原样返回。
+func (h *Handler) visibleModels(infos []upstream.ModelInfo) []upstream.ModelInfo {
+	if h.cfg.ShowInternalModels {
+		return infos
+	}
+	out := make([]upstream.ModelInfo, 0, len(infos))
+	for _, mi := range infos {
+		if isInternalModel(mi.ID, mi.IsCustomModel) {
+			continue
+		}
+		out = append(out, mi)
+	}
+	return out
+}
+
+// staticModelList 静态回退表，按同一规则过滤内部条目。
+func (h *Handler) staticModelList() []map[string]any {
+	if h.cfg.ShowInternalModels {
+		return staticModels
+	}
+	out := make([]map[string]any, 0, len(staticModels))
+	for _, m := range staticModels {
+		if id, _ := m["id"].(string); isInternalModel(id, false) {
+			continue
+		}
+		out = append(out, m)
+	}
+	if len(out) == 0 {
+		return staticModels
+	}
+	return out
 }
 
 // fetchDynamicModels 从池中任一健康账号拉模型列表（get_detail_param），缓存 1h。

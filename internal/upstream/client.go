@@ -318,9 +318,13 @@ type ModelInfo struct {
 	Name          string
 	ContextWindow int64 // = maxInputTokens
 	MaxTokens     int64 // = maxOutputTokens
+	// IsCustomModel 自定义模型（第三方代理，需额外授权）；
+	// 部分模型上游不返回该字段，调用方可用 custom_model_ 前缀兜底。
+	IsCustomModel bool
 }
 
 // FetchModels 拉 SOLO 模型表（get_detail_param，32 配置）。
+// 按 config_name 去重：上游可能为同一模型返回多条配置。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	body := map[string]any{
 		"function":            Function,
@@ -343,9 +347,10 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	}
 	var resp struct {
 		ConfigInfoList []struct {
-			ConfigName string `json:"config_name"`
+			ConfigName    string `json:"config_name"`
 			DisplayConfig struct {
-				DisplayName string `json:"display_name"`
+				DisplayName   string `json:"display_name"`
+				IsCustomModel bool   `json:"is_custom_model"`
 			} `json:"display_config"`
 			ModelDetailList []struct {
 				ModelName string `json:"model_name"`
@@ -355,14 +360,18 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return nil, fmt.Errorf("models parse: %w", err)
 	}
+	seen := make(map[string]bool, len(resp.ConfigInfoList))
 	out := make([]ModelInfo, 0, len(resp.ConfigInfoList))
 	for _, cfg := range resp.ConfigInfoList {
-		if cfg.ConfigName == "" {
+		name := strings.TrimSpace(cfg.ConfigName)
+		if name == "" || seen[name] {
 			continue
 		}
+		seen[name] = true
 		out = append(out, ModelInfo{
-			ID:   cfg.ConfigName,
-			Name: cfg.DisplayConfig.DisplayName,
+			ID:            name,
+			Name:          cfg.DisplayConfig.DisplayName,
+			IsCustomModel: cfg.DisplayConfig.IsCustomModel,
 		})
 	}
 	if len(out) == 0 {

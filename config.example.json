@@ -15,5 +15,6 @@
   },
   "upstream": {
     "timeout_seconds": 120
-  }
+  },
+  "show_internal_models": false
 }

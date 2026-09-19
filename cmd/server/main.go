@@ -52,14 +52,15 @@ func main() {
 	})
 
 	h := server.NewHandler(server.Config{
-		Pool:         p,
-		Upstream:     up,
-		APIKey:       cfg.APIKey,
-		PlanCooldown: cfg.PlanCreditDur,
-		SoftCooldown: cfg.SoftRateDur,
-		ErrThreshold: cfg.Cooldown.ErrThresh,
-		ErrCooldown:  cfg.ErrCooldownDur,
-		DefaultModel: cfg.DefaultModel,
+		Pool:               p,
+		Upstream:           up,
+		APIKey:             cfg.APIKey,
+		PlanCooldown:       cfg.PlanCreditDur,
+		SoftCooldown:       cfg.SoftRateDur,
+		ErrThreshold:       cfg.Cooldown.ErrThresh,
+		ErrCooldown:        cfg.ErrCooldownDur,
+		DefaultModel:       cfg.DefaultModel,
+		ShowInternalModels: cfg.ShowInternalModels,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

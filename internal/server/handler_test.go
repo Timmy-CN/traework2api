@@ -229,17 +229,82 @@ func TestModelsEndpoint(t *testing.T) {
 		t.Errorf("object=%v", resp["object"])
 	}
 	data := resp["data"].([]any)
-	if len(data) != 32 {
-		t.Errorf("models count=%d want 32", len(data))
+	if len(data) != 17 {
+		t.Errorf("models count=%d want 17 (static table with internal entries filtered)", len(data))
 	}
 	found := false
 	for _, m := range data {
-		if m.(map[string]any)["id"] == "glm-5.2" {
+		id := m.(map[string]any)["id"].(string)
+		if id == "glm-5.2" {
 			found = true
+		}
+		if isInternalModel(id, false) {
+			t.Errorf("internal model %q must not be listed", id)
 		}
 	}
 	if !found {
 		t.Error("glm-5.2 missing")
+	}
+}
+
+// TestModelsInternalEntriesFiltered 回归：静态回退表里的内部配置
+// （custom_model_* / *subagent* / summary）不得出现在 /v1/models。
+func TestModelsInternalEntriesFiltered(t *testing.T) {
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: upstream.New()})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+	var resp map[string]any
+	json.Unmarshal(rec.Body.Bytes(), &resp)
+	banned := map[string]bool{
+		"custom_model_placeholder": true, "custom_model_claude": true,
+		"browser_use_subagent": true, "explore_sub_agent_v13": true, "summary": true,
+	}
+	for _, m := range resp["data"].([]any) {
+		id := m.(map[string]any)["id"].(string)
+		if banned[id] {
+			t.Errorf("internal model %q leaked into /v1/models", id)
+		}
+	}
+}
+
+// TestModelsShowInternalModels 开关打开时应返回全量 32 条静态表。
+func TestModelsShowInternalModels(t *testing.T) {
+	h := NewHandler(Config{
+		Pool:               testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream:           upstream.New(),
+		ShowInternalModels: true,
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+	var resp map[string]any
+	json.Unmarshal(rec.Body.Bytes(), &resp)
+	if len(resp["data"].([]any)) != 32 {
+		t.Errorf("models count=%d want 32 with ShowInternalModels", len(resp["data"].([]any)))
+	}
+}
+
+// TestIsInternalModel 过滤谓词的边界。
+func TestIsInternalModel(t *testing.T) {
+	cases := []struct {
+		id       string
+		isCustom bool
+		want     bool
+	}{
+		{"glm-5.2", false, false},
+		{"glm-5-turbo", false, false},
+		{"Doubao-Seed-2.1-Pro", false, false},
+		{"", false, true},                          // 空名
+		{"custom_model_claude", false, true},       // 前缀兜底
+		{"claude-sonnet", true, true},              // is_custom_model 标记
+		{"browser_use_subagent", false, true},      // 子代理
+		{"Explore_Sub_Agent_v13", false, true},     // 子代理（大小写不敏感）
+		{"summary", false, true},                   // 摘要器
+		{"summarize-pro", false, false},            // summary 是整名匹配，前缀不算
+	}
+	for _, c := range cases {
+		if got := isInternalModel(c.id, c.isCustom); got != c.want {
+			t.Errorf("isInternalModel(%q,%v)=%v want %v", c.id, c.isCustom, got, c.want)
+		}
 	}
 }
 
