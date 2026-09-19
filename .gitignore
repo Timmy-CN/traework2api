@@ -6,13 +6,20 @@ config.json
 *.key
 *.pem
 
-# 二进制
-login
-signin
-credit
-signin_bin
-tw2api
-server
+# 二进制（前导 / 限定只匹配仓库根目录的编译产物，
+# 避免误匹配 cmd/signin/ 等同名源码目录）
+/login
+/login.exe
+/signin
+/signin.exe
+/credit
+/credit.exe
+/signin_bin
+/signin_bin.exe
+/tw2api
+/tw2api.exe
+/server
+/server.exe
 
 # 文档(doc 排除上传): 本地 md 不入库,README 除外
 *.md
