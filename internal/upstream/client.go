@@ -416,7 +416,8 @@ func (r checkinResp) businessErr() error {
 
 // CheckinStatus 查询签到状态。业务码非零或 success=false 时返回错误。
 func (c *Client) CheckinStatus(a *auth.Auth) (checkedIn bool, credits int64, enable bool, err error) {
-	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinStatus, bytes.NewReader([]byte("{}")))
+	// 官方客户端签到请求体为 {"req_source":1}（抓包确认），非 {}。
+	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinStatus, bytes.NewReader([]byte(`{"req_source":1}`)))
 	if err != nil {
 		return false, 0, false, err
 	}
@@ -452,7 +453,7 @@ func (c *Client) CheckinStatus(a *auth.Auth) (checkedIn bool, credits int64, ena
 // 是否真正签到成功由 DailyCheckin 的二次 status 复核裁决。
 func (c *Client) CheckinClaim(a *auth.Auth) error {
 	for attempt := 0; ; attempt++ {
-		req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinClaim, bytes.NewReader([]byte("{}")))
+		req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinClaim, bytes.NewReader([]byte(`{"req_source":1}`)))
 		if err != nil {
 			return err
 		}

@@ -8,10 +8,12 @@ const (
 	ConsoleHost    = "https://www.trae.cn"
 	ClientID       = "en1oxy7wnw8j9n" // SOLO stable
 	AppID          = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
-	IdeVersion     = "0.1.43"
-	IdeVersionCode = "20260716"
-	DeviceBrand    = "83DG"
-	OSVersion      = "Windows 11 Pro"
+	// IdeVersion / IdeVersionCode 与官方客户端对齐（2026-09 实测 Trae CN 3.3.102；
+	// 旧值 0.1.43/20260716 仍可用，但对齐后模型列表多 1 条有效条目、更不易被风控）。
+	IdeVersion     = "3.3.102"
+	IdeVersionCode = "20260912"
+	DeviceBrand    = "System Product Name"
+	OSVersion      = "Windows 10 Pro"
 	Function       = "solo_work_lite"
 
 	// 端点
