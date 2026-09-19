@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"traework2api/internal/auth"
 	"traework2api/internal/pool"
@@ -229,8 +230,8 @@ func TestModelsEndpoint(t *testing.T) {
 		t.Errorf("object=%v", resp["object"])
 	}
 	data := resp["data"].([]any)
-	if len(data) != 20 {
-		t.Errorf("models count=%d want 20 (static table with internal entries filtered)", len(data))
+	if len(data) != 21 {
+		t.Errorf("models count=%d want 21 (static table with internal entries filtered)", len(data))
 	}
 	found := false
 	for _, m := range data {
@@ -279,8 +280,59 @@ func TestModelsShowInternalModels(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
 	var resp map[string]any
 	json.Unmarshal(rec.Body.Bytes(), &resp)
-	if len(resp["data"].([]any)) != 39 {
-		t.Errorf("models count=%d want 39 with ShowInternalModels", len(resp["data"].([]any)))
+	if len(resp["data"].([]any)) != 40 {
+		t.Errorf("models count=%d want 40 with ShowInternalModels", len(resp["data"].([]any)))
+	}
+}
+
+// TestModelsDisplayName 动态结果应带 display_name（便于与 IDE 界面对照），
+// 同时验证内部条目在动态路径上同样被过滤。
+func TestModelsDisplayName(t *testing.T) {
+	reset := func() {
+		dynamicModelsCache.Lock()
+		dynamicModelsCache.ids = nil
+		dynamicModelsCache.fetched = time.Time{}
+		dynamicModelsCache.lastFail = time.Time{}
+		dynamicModelsCache.Unlock()
+	}
+	reset()
+	defer reset()
+
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body: io.NopCloser(strings.NewReader(`{"config_info_list":[
+					{"config_name":"glm-5.3","display_config":{"display_name":"GLM-5.3"}},
+					{"config_name":"custom_model_x","display_config":{"display_name":"Custom"}},
+					{"config_name":"summary","display_config":{"display_name":""}}
+				]}`)),
+			}, nil
+		})},
+		AgentHost: "https://fake.example",
+		UgHost:    "https://fake.example",
+		OAuthHost: "https://fake.example",
+		ClientID:  upstream.ClientID,
+	}
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+	var resp struct {
+		Data []map[string]any `json:"data"`
+	}
+	json.Unmarshal(rec.Body.Bytes(), &resp)
+	if len(resp.Data) != 1 {
+		t.Fatalf("models=%d want 1 (custom_/summary filtered on dynamic path)", len(resp.Data))
+	}
+	if resp.Data[0]["id"] != "glm-5.3" {
+		t.Errorf("id=%v", resp.Data[0]["id"])
+	}
+	if resp.Data[0]["display_name"] != "GLM-5.3" {
+		t.Errorf("display_name=%v want GLM-5.3", resp.Data[0]["display_name"])
 	}
 }
 

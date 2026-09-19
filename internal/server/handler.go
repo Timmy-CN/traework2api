@@ -162,7 +162,7 @@ func (h *Handler) knownModel(model string) bool {
 	return false
 }
 
-// 静态 SOLO 模型表（2026-09-19 实测 get_detail_param 快照，39 个全局 config_name；
+// 静态 SOLO 模型表（2026-09-19 实测 get_detail_param 快照，40 个全局 config_name；
 // 动态拉取失败时回退；不含账号级自定义模型，内部配置在响应时过滤）。
 var staticModels = []map[string]any{
 	{"id": "Doubao-Seed-Evolving", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
@@ -173,6 +173,7 @@ var staticModels = []map[string]any{
 	{"id": "Doubao-Seed-2.0-Code", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "browser_use_subagent", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
+	{"id": "glm-5.3", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "glm-5-turbo", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "glm-5", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 	{"id": "DeepSeek-V4-Flash-Official", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
@@ -244,6 +245,11 @@ func (h *Handler) modelList() []map[string]any {
 			}
 			if entry["context_length"] == 0 {
 				entry["context_length"] = 131072
+			}
+			// display_name 是官方客户端的展示名（如 glm-5.3 → GLM-5.3），
+			// 便于与 IDE 界面对照；OpenAI 客户端不认识该字段，会忽略。
+			if mi.Name != "" {
+				entry["display_name"] = mi.Name
 			}
 			out = append(out, entry)
 		}
