@@ -183,7 +183,7 @@ func TestChatStreamSendsHeadersAndRewritesBody(t *testing.T) {
 	if gotAuth != "Cloud-IDE-JWT at" || gotUID != "u1" {
 		t.Errorf("headers: auth=%q uid=%q", gotAuth, gotUID)
 	}
-	if gotAppID != AppID || gotIdeVer != "0.1.43" {
+	if gotAppID != AppID || gotIdeVer != IdeVersion {
 		t.Errorf("app headers: appid=%q idever=%q", gotAppID, gotIdeVer)
 	}
 	if !bytes.Contains(gotBody, []byte(`"stream":true`)) || !bytes.Contains(gotBody, []byte(`"function":"solo_work_lite"`)) {
@@ -250,16 +250,16 @@ func TestUserEntUsageAggregation(t *testing.T) {
 	}
 }
 
-func TestCheckinStatusAndClaim(t *testing.T) {
+func TestCheckinStatusSendsOfficialDeviceHeaders(t *testing.T) {
 	var path string
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		path = r.URL.Path
-		if r.Header.Get("X-User-Region") != "CN" {
-			return nil, errors.New("missing X-User-Region")
+		if r.Header.Get("X-Device-Id") != "1111222233334444" || r.Header.Get("X-Device-Brand") != "90SB001GCD" || r.Header.Get("X-Device-Type") != "windows" {
+			return nil, errors.New("missing official device headers")
 		}
 		return jsonResp(200, `{"checked_in":false,"credits":200,"enable":true}`), nil
 	})
-	checkedIn, credits, enable, err := c.CheckinStatus(&auth.Auth{AccessToken: "at"})
+	checkedIn, credits, enable, err := c.CheckinStatus(&auth.Auth{AccessToken: "at", DeviceID: "model-device", CheckinDeviceID: "1111222233334444", CheckinDeviceBrand: "90SB001GCD", CheckinDeviceType: "windows"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -428,5 +428,17 @@ func TestCheckinStatusBusinessError(t *testing.T) {
 	})
 	if _, _, _, err := c.CheckinStatus(&auth.Auth{AccessToken: "at"}); err == nil {
 		t.Fatal("status code!=0 must be an error")
+	}
+}
+
+// TestCheckinStatusRejectsMissingStateFields 状态响应缺 checked_in/enable 字段属于
+// 协议异常，必须报错而不是当成「未签到」去 claim（PR #9）。
+func TestCheckinStatusRejectsMissingStateFields(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"message":"success"}`), nil
+	})
+	_, _, _, err := c.CheckinStatus(&auth.Auth{AccessToken: "at"})
+	if err == nil || !strings.Contains(err.Error(), "missing checked_in or enable") {
+		t.Fatalf("error=%v want protocol failure", err)
 	}
 }

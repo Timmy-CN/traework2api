@@ -374,10 +374,12 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 // checkinResp 签到 status/claim 的公共响应字段。
 // 上游失败时仍返回 HTTP 200，错误只体现在 code / success / message 里，
 // 因此必须解析 body，不能只看状态码。
+// CheckedIn/Enable 用指针区分「字段缺失」与显式 false：status 响应缺字段属于
+// 异常响应，必须报错而不是当成「未签到」去 claim。
 type checkinResp struct {
-	CheckedIn bool   `json:"checked_in"`
+	CheckedIn *bool  `json:"checked_in"`
 	Credits   int64  `json:"credits"`
-	Enable    bool   `json:"enable"`
+	Enable    *bool  `json:"enable"`
 	Code      int    `json:"code"`
 	Message   string `json:"message"`
 	Msg       string `json:"msg"`
@@ -425,9 +427,14 @@ func (c *Client) CheckinStatus(a *auth.Auth) (checkedIn bool, credits int64, ena
 		log.Printf("checkin status uid=%s: %v", a.UID, berr)
 		return false, 0, false, berr
 	}
+	if resp.CheckedIn == nil || resp.Enable == nil {
+		err := fmt.Errorf("checkin status: missing checked_in or enable")
+		log.Printf("checkin status uid=%s: %v", a.UID, err)
+		return false, 0, false, err
+	}
 	log.Printf("checkin status uid=%s checked_in=%t credits=%d enable=%t",
-		a.UID, resp.CheckedIn, resp.Credits, resp.Enable)
-	return resp.CheckedIn, resp.Credits, resp.Enable, nil
+		a.UID, *resp.CheckedIn, resp.Credits, *resp.Enable)
+	return *resp.CheckedIn, resp.Credits, *resp.Enable, nil
 }
 
 // CheckinClaim 执行签到。
@@ -497,7 +504,10 @@ func (c *Client) DailyCheckin(a *auth.Auth) error {
 	return nil
 }
 
-// UserEntUsage 聚合积分（ide_user_ent_usage 的 credits_limit 求和）。
+// UserEntUsage 聚合剩余积分（ide_user_ent_usage）。
+// 上游每个包的 quota.credits_limit 为总额度，usage.credits_amount 为已消耗，
+// 剩余 = Σ(credits_limit) − Σ(usage.credits_amount)。
+// 旧实现只求和 credits_limit，导致把总额度当剩余且永不变动，故修正。
 func (c *Client) UserEntUsage(a *auth.Auth) (remain int64, err error) {
 	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpEntUsage, bytes.NewReader([]byte("{}")))
 	if err != nil {
@@ -509,20 +519,30 @@ func (c *Client) UserEntUsage(a *auth.Auth) (remain int64, err error) {
 		return 0, err
 	}
 	var resp struct {
-		IsCreditsBilling bool `json:"is_credits_billing"`
+		IsCreditsBilling        bool `json:"is_credits_billing"`
 		UserEntitlementPackList []struct {
 			EntitlementBaseInfo struct {
 				Quota struct {
 					CreditsLimit int64 `json:"credits_limit"`
 				} `json:"quota"`
 			} `json:"entitlement_base_info"`
+			Usage struct {
+				CreditsAmount float64 `json:"credits_amount"`
+			} `json:"usage"`
 		} `json:"user_entitlement_pack_list"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return 0, fmt.Errorf("ent usage parse: %w", err)
 	}
+	var limit, used float64
 	for _, p := range resp.UserEntitlementPackList {
-		remain += p.EntitlementBaseInfo.Quota.CreditsLimit
+		limit += float64(p.EntitlementBaseInfo.Quota.CreditsLimit)
+		used += p.Usage.CreditsAmount
+	}
+	// 剩余不能为负；API 仅提供总额度与已用量，无独立剩余字段。
+	remain = int64(limit - used)
+	if remain < 0 {
+		remain = 0
 	}
 	return remain, nil
 }

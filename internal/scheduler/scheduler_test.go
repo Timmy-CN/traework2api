@@ -115,7 +115,7 @@ func TestRunCheckinReenablesCoolingAccount(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	a := &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}
+	a := &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999, CheckinDeviceID: "cd-u1"}
 	p.Add(a)
 	p.Cooldown("u1", pool.CoolPlan, time.Hour, "plan limit")
 
@@ -134,6 +134,58 @@ func TestRunCheckinReenablesCoolingAccount(t *testing.T) {
 	}
 	if st.Credits != 500 {
 		t.Errorf("credits=%d want 500", st.Credits)
+	}
+}
+
+func TestRunCheckinDoesNotLogSuccessWhenStatusDoesNotChange(t *testing.T) {
+	// claimBody 设为成功响应但不翻转服务端状态：模拟「claim 接受但实际没签上」，
+	// DailyCheckin 的复核必须拦截，调度器不得输出 checkin ok。
+	f := &fakeUpstream{resourceRemain: 500, claimBody: `{"code":0,"message":"success"}`}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999, CheckinDeviceID: "cd-u1"})
+
+	var logs strings.Builder
+	old := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(old)
+
+	s := newTestScheduler(f, p, srv)
+	s.RunCheckinNow()
+	if strings.Contains(logs.String(), "checkin u1: ok") {
+		t.Fatalf("false success log: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "checkin verify uid=u1") {
+		t.Fatalf("missing verification failure: %s", logs.String())
+	}
+}
+
+// 凭证缺 checkinDeviceId 且无法从本机官方客户端自动读取时，
+// 必须跳过签到并打印明确提示，不发无设备头的无效请求，也不生成随机假 ID。
+func TestRunCheckinSkipsMissingCheckinDeviceID(t *testing.T) {
+	t.Setenv("TW2A_DISABLE_CHECKIN_DETECT", "1") // 隔离本机官方客户端数据，保持用例 hermetic
+	f := &fakeUpstream{resourceRemain: 500}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+
+	var logs strings.Builder
+	old := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(old)
+
+	s := newTestScheduler(f, p, srv)
+	s.RunCheckinNow()
+	if f.checkinCalls.Load() != 0 || f.claimCalls.Load() != 0 {
+		t.Errorf("no upstream checkin calls expected, status=%d claim=%d",
+			f.checkinCalls.Load(), f.claimCalls.Load())
+	}
+	if !strings.Contains(logs.String(), "缺签到设备ID") {
+		t.Fatalf("missing skip hint: %s", logs.String())
 	}
 }
 
