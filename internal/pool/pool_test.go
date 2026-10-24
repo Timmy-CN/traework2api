@@ -205,3 +205,35 @@ func TestSyncToDirRemovesMissing(t *testing.T) {
 		t.Fatal("u1 should not exist")
 	}
 }
+
+// TestCheckinIneligibleDayPersistsAndExpires 当天不可领取标记：
+// 持久化到 state.json，跨天后自动失效（CheckinIneligibleToday=false）。
+func TestCheckinIneligibleDayPersistsAndExpires(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.MarkCheckinIneligible("u1")
+	if !p.CheckinIneligibleToday("u1") {
+		t.Fatal("u1 should be ineligible today")
+	}
+	st, _ := p.Status("u1")
+	if st.CheckinIneligibleDay == "" {
+		t.Errorf("status should carry day: %+v", st)
+	}
+
+	// 重载后保留。
+	p2 := New(fp)
+	if !p2.CheckinIneligibleToday("u1") {
+		t.Fatal("ineligible day lost after reload")
+	}
+
+	// 次日（日期回退为昨天）自动失效。
+	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+	if err := p2.SetCheckinIneligibleDayForTest("u1", yesterday); err != nil {
+		t.Fatal(err)
+	}
+	if p2.CheckinIneligibleToday("u1") {
+		t.Fatal("yesterday's mark must expire")
+	}
+}

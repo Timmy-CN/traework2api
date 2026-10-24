@@ -4,6 +4,7 @@ package pool
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -44,6 +45,9 @@ type Status struct {
 	Reason   string    `json:"reason,omitempty"`
 	Disabled bool      `json:"disabled"`
 	ErrCount int       `json:"err_count,omitempty"`
+	// CheckinIneligibleDay 该账号当天不可签到的本地日期（9095/9074），
+	// 过期后自动失效；空表示可签到。
+	CheckinIneligibleDay string `json:"checkin_ineligible_day,omitempty"`
 }
 
 type entry struct {
@@ -53,6 +57,8 @@ type entry struct {
 	reason   string
 	until    time.Time
 	errCount int
+	// checkinIneligibleDay 当天不可签到的日期（本地），格式 2006-01-02。
+	checkinIneligibleDay string
 }
 
 func (e *entry) healthy(now time.Time) bool {
@@ -68,10 +74,11 @@ func (e *entry) healthy(now time.Time) bool {
 // stateFile 持久化格式。
 type stateFile struct {
 	Accounts map[string]struct {
-		Credits  int64     `json:"credits"`
-		Disabled bool      `json:"disabled"`
-		Reason   string    `json:"reason,omitempty"`
-		Until    time.Time `json:"until,omitempty"`
+		Credits              int64     `json:"credits"`
+		Disabled             bool      `json:"disabled"`
+		Reason               string    `json:"reason,omitempty"`
+		Until                time.Time `json:"until,omitempty"`
+		CheckinIneligibleDay string    `json:"checkin_ineligible_day,omitempty"`
 	} `json:"accounts"`
 }
 
@@ -198,6 +205,38 @@ func (p *Pool) ReenableIfCredits(uid string, remain int64) {
 	p.saveLocked()
 }
 
+// MarkCheckinIneligible 记录账号当天不可领取（claim 业务码 9095/9074）：
+// 当天后续轮次跳过签到，次日自动恢复。
+func (p *Pool) MarkCheckinIneligible(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.checkinIneligibleDay = time.Now().Format("2006-01-02")
+	}
+	p.saveLocked()
+}
+
+// CheckinIneligibleToday 账号是否当天不可领取（过期自动失效）。
+func (p *Pool) CheckinIneligibleToday(uid string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, ok := p.byUID[uid]
+	return ok && e.checkinIneligibleDay == time.Now().Format("2006-01-02")
+}
+
+// SetCheckinIneligibleDayForTest 直接改写不可领取日期（测试跨天场景用）。
+func (p *Pool) SetCheckinIneligibleDayForTest(uid, day string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return fmt.Errorf("pool: unknown uid %q", uid)
+	}
+	e.checkinIneligibleDay = day
+	p.saveLocked()
+	return nil
+}
+
 // NoteError 记录一次错误；达到 threshold 自动冷却 d 时长。
 func (p *Pool) NoteError(uid string, threshold int, d time.Duration) {
 	p.mu.Lock()
@@ -262,14 +301,15 @@ func (p *Pool) List() []Status {
 func (p *Pool) statusOf(uid string, e *entry) Status {
 	now := time.Now()
 	return Status{
-		UID:      uid,
-		Nickname: e.a.Nickname,
-		Credits:  e.credits,
-		Cooling:  !e.until.IsZero() && now.Before(e.until),
-		Until:    e.until,
-		Reason:   e.reason,
-		Disabled: e.disabled,
-		ErrCount: e.errCount,
+		UID:                  uid,
+		Nickname:             e.a.Nickname,
+		Credits:              e.credits,
+		Cooling:              !e.until.IsZero() && now.Before(e.until),
+		Until:                e.until,
+		Reason:               e.reason,
+		Disabled:             e.disabled,
+		ErrCount:             e.errCount,
+		CheckinIneligibleDay: e.checkinIneligibleDay,
 	}
 }
 
@@ -288,11 +328,12 @@ func (p *Pool) load() {
 	}
 	for uid, s := range sf.Accounts {
 		p.byUID[uid] = &entry{
-			a:        &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
-			credits:  s.Credits,
-			disabled: s.Disabled,
-			reason:   s.Reason,
-			until:    s.Until,
+			a:                    &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
+			credits:              s.Credits,
+			disabled:             s.Disabled,
+			reason:               s.Reason,
+			until:                s.Until,
+			checkinIneligibleDay: s.CheckinIneligibleDay,
 		}
 	}
 }
@@ -302,22 +343,25 @@ func (p *Pool) saveLocked() {
 		return
 	}
 	sf := stateFile{Accounts: map[string]struct {
-		Credits  int64     `json:"credits"`
-		Disabled bool      `json:"disabled"`
-		Reason   string    `json:"reason,omitempty"`
-		Until    time.Time `json:"until,omitempty"`
+		Credits              int64     `json:"credits"`
+		Disabled             bool      `json:"disabled"`
+		Reason               string    `json:"reason,omitempty"`
+		Until                time.Time `json:"until,omitempty"`
+		CheckinIneligibleDay string    `json:"checkin_ineligible_day,omitempty"`
 	}{}}
 	for uid, e := range p.byUID {
 		sf.Accounts[uid] = struct {
-			Credits  int64     `json:"credits"`
-			Disabled bool      `json:"disabled"`
-			Reason   string    `json:"reason,omitempty"`
-			Until    time.Time `json:"until,omitempty"`
+			Credits              int64     `json:"credits"`
+			Disabled             bool      `json:"disabled"`
+			Reason               string    `json:"reason,omitempty"`
+			Until                time.Time `json:"until,omitempty"`
+			CheckinIneligibleDay string    `json:"checkin_ineligible_day,omitempty"`
 		}{
-			Credits:  e.credits,
-			Disabled: e.disabled,
-			Reason:   e.reason,
-			Until:    e.until,
+			Credits:              e.credits,
+			Disabled:             e.disabled,
+			Reason:               e.reason,
+			Until:                e.until,
+			CheckinIneligibleDay: e.checkinIneligibleDay,
 		}
 	}
 	raw, err := json.MarshalIndent(sf, "", "  ")

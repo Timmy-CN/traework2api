@@ -197,7 +197,9 @@ type reshapedTurn struct {
 
 // reshapeMessages 把 OpenAI messages 整形为 Trae llm_utils_chat 的形状。
 // native 表示请求是否向 Trae 声明了 tools（声明了才用原生工具往返）。
-func reshapeMessages(obj map[string]any) {
+// sees 表示模型是否收图（目录 multimodal 口径）：不收图的模型图片替换占位
+// 文本（"[an image, which this model can't see]"），收图或目录没说才透传。
+func reshapeMessages(obj map[string]any, sees bool) {
 	rawMsgs, _ := obj["messages"].([]any)
 
 	native := false
@@ -232,6 +234,13 @@ func reshapeMessages(obj map[string]any) {
 			role = "system"
 		}
 		text, images := contentParts(m["content"])
+		if !sees && len(images) > 0 {
+			// 模型不收图（目录 multimodal=false）：图片换成占位文本。
+			for range images {
+				text = joinNonEmpty(text, visionPlaceholderSuffix)
+			}
+			images = nil
+		}
 
 		tcs, _ := m["tool_calls"].([]any)
 		if role == "assistant" && len(tcs) > 0 {

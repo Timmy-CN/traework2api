@@ -3,15 +3,17 @@
 package upstream
 
 import (
-	"context"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"traework2api/internal/auth"
@@ -298,10 +300,12 @@ func normalizeExpiresAt(v int64) int64 {
 }
 
 // ChatStream 发 llm_utils_chat 请求并返回原始 SSE body 流（调用方负责 Close）。
-// 非 2xx 时 rc 为 nil、body 为上游响应体（供调用方 Classify）、err 为 nil；
+// opts.Function 为空 → 默认 solo_work_lite；opts 携带 function/Max 模式/
+// multimodal 门控/reasoning 等级（PrepareBodyOpts 口径）。非 2xx 时 rc 为 nil、
+// body 为上游响应体（供调用方 Classify 与 wrongFunction 判定）、err 为 nil；
 // 只有传输层失败才返回 err。
-func (c *Client) ChatStream(a *auth.Auth, body []byte, session, who string) (rc io.ReadCloser, status int, respBody []byte, err error) {
-	req, err := http.NewRequest(http.MethodPost, c.agentBase()+EpChat, bytes.NewReader(PrepareBody(body, session, who)))
+func (c *Client) ChatStream(a *auth.Auth, body []byte, opts ChatOpts, session, who string) (rc io.ReadCloser, status int, respBody []byte, err error) {
+	req, err := http.NewRequest(http.MethodPost, c.agentBase()+EpChat, bytes.NewReader(PrepareBodyOpts(body, opts, session, who)))
 	if err != nil {
 		return nil, 0, nil, err
 	}
@@ -333,16 +337,130 @@ type ModelInfo struct {
 	Name          string
 	ContextWindow int64 // = maxInputTokens
 	MaxTokens     int64 // = maxOutputTokens
+	// InternalName 模型内部名（model_detail_list 的 __dev 细目；Max 条目为
+	// __max 细目名）。列表没说 → 空，请求体不带 model_name。
+	InternalName string
+	// Function 列出该模型的 function（chat_v3 / solo_work_lite / ...）：
+	// 聊天请求默认走它，被上游以 wrongFunction 码拒绝时换其他 function 重试。
+	Function string
+	// IsMax 条目是 <id>-max 形态的 Max 模式条目（base = 去掉后缀的 id）。
+	IsMax bool
 	// IsCustomModel 自定义模型（第三方代理，需额外授权）；
 	// 部分模型上游不返回该字段，调用方可用 custom_model_ 前缀兜底。
 	IsCustomModel bool
 }
 
-// FetchModels 拉 SOLO 模型表（get_detail_param，32 配置）。
-// 按 config_name 去重：上游可能为同一模型返回多条配置。
-func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
+// batchResp / detailResp 两个模型端点的响应（data 包裹可选）。
+type (
+	batchResp struct {
+		FunctionConfigs []struct {
+			Function       string     `json:"function"`
+			ConfigInfoList []rawEntry `json:"config_info_list"`
+		} `json:"function_configs"`
+		Data *batchResp `json:"data"`
+	}
+	detailResp struct {
+		ConfigInfoList []rawEntry `json:"config_info_list"`
+		Data           *detailResp `json:"data"`
+	}
+)
+
+// fetchCatalog 拉全部 function 的模型目录（插件 liveModels 口径）：
+// 先 batch_get_detail_param 一次取全部；失败或为空再逐 function
+// get_detail_param（一个 function 失败不影响其他）。任一来源拿到条目即成功。
+func (c *Client) fetchCatalog(a *auth.Auth) (*catalog, error) {
+	lists, err := c.batchLists(a)
+	if err != nil {
+		return nil, err
+	}
+	if lists == nil {
+		lists = map[string][]rawEntry{}
+		got := make([][]rawEntry, len(chatFunctions))
+		errs := make([]error, len(chatFunctions))
+		var wg sync.WaitGroup
+		for i, fn := range chatFunctions {
+			wg.Add(1)
+			go func(i int, fn string) {
+				defer wg.Done()
+				got[i], errs[i] = c.listOf(a, fn)
+			}(i, fn)
+		}
+		wg.Wait()
+		for i := range got {
+			if errs[i] != nil {
+				if i == 0 {
+					// 全失败时对外报第一个 function 的错误（插件取 got[0].reason）。
+					for j := range errs {
+						if errs[j] != nil {
+							return nil, errs[j]
+						}
+					}
+				}
+				continue
+			}
+			lists[chatFunctions[i]] = got[i]
+		}
+	}
+	cat := newCatalog()
+	cat.add(lists)
+	if len(cat.order) == 0 {
+		return nil, fmt.Errorf("models api returned empty list")
+	}
+	return cat, nil
+}
+
+// batchLists 全部 function 的模型列表一次取（batch_get_detail_param）。
+// Trae 回了无列表（HTTP 200 但 function_configs 缺失）→ nil, nil。
+func (c *Client) batchLists(a *auth.Auth) (map[string][]rawEntry, error) {
 	body := map[string]any{
-		"function":            Function,
+		"functions":       chatFunctions,
+		"agent_type":      "",
+		"current_config_info": map[string]any{"config_name": "", "is_custom_model": false},
+		"mode_type":           0,
+		"access_type":         0,
+		"ab_force_vids":       "",
+		"ab_autotest_advanced_mode": 0,
+		"show_custom_model":         true,
+	}
+	raw, _ := json.Marshal(body)
+	req, err := http.NewRequest(http.MethodPost, c.agentBase()+EpBatchModels, bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	SOLOHeaders(req, a, false)
+	data, err := c.doJSON(req)
+	if err != nil {
+		return nil, err
+	}
+	var resp batchResp
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("models parse: %w", err)
+	}
+	if resp.Data != nil && len(resp.FunctionConfigs) == 0 {
+		resp = *resp.Data
+	}
+	out := map[string][]rawEntry{}
+	for _, g := range resp.FunctionConfigs {
+		if !slices.Contains(chatFunctions, g.Function) {
+			continue
+		}
+		for _, m := range g.ConfigInfoList {
+			if strings.TrimSpace(m.ConfigName) == "" {
+				continue
+			}
+			out[g.Function] = append(out[g.Function], m)
+		}
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+// listOf 一个 function 的模型列表（get_detail_param）。
+func (c *Client) listOf(a *auth.Auth, fn string) ([]rawEntry, error) {
+	body := map[string]any{
+		"function":            fn,
 		"config_names":        nil,
 		"need_prompt":         false,
 		"current_config_info": nil,
@@ -360,39 +478,37 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	var resp struct {
-		ConfigInfoList []struct {
-			ConfigName    string `json:"config_name"`
-			DisplayConfig struct {
-				DisplayName   string `json:"display_name"`
-				IsCustomModel bool   `json:"is_custom_model"`
-			} `json:"display_config"`
-			ModelDetailList []struct {
-				ModelName string `json:"model_name"`
-			} `json:"model_detail_list"`
-		} `json:"config_info_list"`
-	}
+	var resp detailResp
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return nil, fmt.Errorf("models parse: %w", err)
 	}
-	seen := make(map[string]bool, len(resp.ConfigInfoList))
-	out := make([]ModelInfo, 0, len(resp.ConfigInfoList))
-	for _, cfg := range resp.ConfigInfoList {
-		name := strings.TrimSpace(cfg.ConfigName)
-		if name == "" || seen[name] {
+	if resp.Data != nil && len(resp.ConfigInfoList) == 0 {
+		resp = *resp.Data
+	}
+	out := make([]rawEntry, 0, len(resp.ConfigInfoList))
+	for _, m := range resp.ConfigInfoList {
+		if strings.TrimSpace(m.ConfigName) == "" {
 			continue
 		}
-		seen[name] = true
-		out = append(out, ModelInfo{
-			ID:            name,
-			Name:          cfg.DisplayConfig.DisplayName,
-			IsCustomModel: cfg.DisplayConfig.IsCustomModel,
-		})
-	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("models api returned empty list")
+		out = append(out, m)
 	}
 	return out, nil
+}
+
+// FetchModels 拉多 function 模型目录，按 site.functions 顺序合并，同 id 首现
+// 优先；带 __max 细目且窗口更大的模型追加 <id>-max 条目。ModelInfo.Function
+// 记录列出者，供聊天 function 回退。
+func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
+	cat, err := c.fetchCatalog(a)
+	if err != nil {
+		return nil, err
+	}
+	infos := cat.infos()
+	for i := range infos {
+		infos[i].Function = cat.fnOf(infos[i].ID)
+		infos[i].IsMax = strings.HasSuffix(infos[i].ID, modelMax)
+	}
+	return infos, nil
 }
 
 // checkinResp 签到 status/claim 的公共响应字段。
@@ -534,7 +650,8 @@ func (c *Client) DailyCheckin(a *auth.Auth) error {
 // 剩余 = Σ(credits_limit) − Σ(usage.credits_amount)。
 // 旧实现只求和 credits_limit，导致把总额度当剩余且永不变动，故修正。
 func (c *Client) UserEntUsage(a *auth.Auth) (remain int64, err error) {
-	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpEntUsage, bytes.NewReader([]byte("{}")))
+	// 插件 usage 口径：body 带 require_usage/req_source（不是空 {}）。
+	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpEntUsage, bytes.NewReader([]byte(`{"require_usage":true,"req_source":0}`)))
 	if err != nil {
 		return 0, err
 	}

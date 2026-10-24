@@ -98,6 +98,16 @@ func deviceProof(priv *ecdsa.PrivateKey, path, clientID, refreshToken string, at
 	return base64.StdEncoding.EncodeToString(sig), nil
 }
 
+// randomRequestID 生成 x-request-id 用的 v4 UUID。
+func randomRequestID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	h := hex.EncodeToString(b)
+	return fmt.Sprintf("%s-%s-%s-%s-%s", h[0:8], h[8:12], h[12:16], h[16:20], h[20:32])
+}
+
 // randomNonceHex 生成 n 字节的 hex 随机串（DeviceProof 的 Nonce）。
 func randomNonceHex(n int) string {
 	b := make([]byte, n)

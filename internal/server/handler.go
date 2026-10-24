@@ -2,6 +2,8 @@
 package server
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -228,6 +230,8 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 }
 
 // modelList 动态获取模型列表并包装成 OpenAI 格式；失败回退静态表。
+// 多 function 目录：各 function 的模型合并，同 id 首现优先；带 __max 细目
+// 且窗口更大的模型追加 <id>-max 条目（context 用 Max 窗口）。
 func (h *Handler) modelList() []map[string]any {
 	if infos := h.fetchDynamicModels(); len(infos) > 0 {
 		visible := h.visibleModels(infos)
@@ -401,9 +405,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	body = setModelInBody(body, configName)
 
+	// 目录信息：请求 function、Max 模式、multimodal、reasoning levels。
+	// 目录不可用时全部按默认（function 默认、sees=false、无等级）。
+	infos := h.fetchDynamicModels()
+	cat := h.catalogOf(infos)
+	fn := h.chatFunction(cat, configName)
+	max := h.maxModeOf(cat, configName)
+	sees := h.seesOf(cat, configName)
+	levels := h.levelsOf(cat, configName)
+
 	tried := map[string]bool{}
+	// wrongFunction 回退：同一账号先试目录 function，被 4001/4023/1005 拒时
+	// 换其他 function 重试一次；成功后把目录里该模型的 function 归属更新。
 	var lastErr error
-	for i := 0; i < h.cfg.MaxRotate; i++ {
+	for range h.cfg.MaxRotate {
 		acct := h.cfg.Pool.PickExcluding(tried)
 		if acct == nil {
 			break
@@ -439,68 +454,74 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if who == "" {
 			who = acct.Nickname
 		}
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body, session, who)
-		if terr != nil {
-			lastErr = terr
-			h.cfg.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
-			continue
+
+		// 本账号内 function 轮换：目录 function 优先，其余按目录顺序补齐
+		// （README:89-92 / 插件 wrongFunction：4001/4023/1005 = 该 function
+		// 不收这个模型，换一个再试）。已试集合按账号隔离（换号后重新轮换）。
+		fnsTried := map[string]bool{}
+		curFn := fn
+		if curFn == "" {
+			curFn = upstream.Function
 		}
-		if status >= 400 {
-			kind := upstream.Classify(status, string(respBody))
-			switch kind {
-			case upstream.ErrPlanLimit:
-				h.cfg.Pool.Cooldown(acct.UID, pool.CoolPlan, h.cfg.PlanCooldown, "plan 权益不足")
-				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
-				continue
-			case upstream.ErrSoftRate:
-				h.cfg.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")
-				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
-				continue
-			case upstream.ErrSessionDead:
-				h.cfg.Pool.Disable(acct.UID, "session dead")
-				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
-				continue
-			case upstream.ErrNotFound:
-				// 404 短冷却不累计 errCount（防雪崩）
-				h.cfg.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "upstream 404")
-				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
-				continue
-			default:
-				h.cfg.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
-				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
-				continue
+		for {
+			if fnsTried[curFn] {
+				break
 			}
-		}
-		if peek.Stream {
-			h.cfg.Pool.NoteSuccess(acct.UID)
-			// 流内业务错误（1005 plan/5xx 等）→ 冷却账号，错误信息注入 SSE。
-			_ = upstream.StreamWithError(w, rc, func(se *upstream.SOLOStreamError) {
-				h.handleStreamError(acct.UID, se)
-			})
-			rc.Close()
-			return
-		}
-		resp, err := upstream.Aggregate(rc)
-		rc.Close() // 已完全消费，立即释放上游连接（防轮转 continue 泄漏 body）
-		if err != nil {
-			// 流内业务错误（如 1005 plan 权益不足）→ 冷却账号并轮转下一账号。
-			var se *upstream.SOLOStreamError
-			if errors.As(err, &se) {
-				lastErr = err
-				switch se.Kind() {
+			fnsTried[curFn] = true
+			rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body, upstream.ChatOpts{
+				Function: curFn, Model: configName, Max: max, Sees: sees, Levels: levels,
+			}, session, who)
+			if terr != nil {
+				lastErr = terr
+				h.cfg.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+				break
+			}
+			if status >= 400 {
+				kind := upstream.Classify(status, string(respBody))
+				if upstream.WrongFunctionCode(upstream.ErrorCodeOf(respBody)) {
+					if next, ok := h.nextFunction(cat, configName, curFn); ok {
+						curFn = next
+						continue
+					}
+				}
+				switch kind {
 				case upstream.ErrPlanLimit:
 					h.cfg.Pool.Cooldown(acct.UID, pool.CoolPlan, h.cfg.PlanCooldown, "plan 权益不足")
+					lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+				case upstream.ErrSoftRate:
+					h.cfg.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")
+					lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+				case upstream.ErrSessionDead:
+					h.cfg.Pool.Disable(acct.UID, "session dead")
+					lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+				case upstream.ErrNotFound:
+					// 404 短冷却不累计 errCount（防雪崩）
+					h.cfg.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "upstream 404")
+					lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 				default:
 					h.cfg.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+					lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 				}
-				continue
+				break
 			}
-			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
-			return
+			// 流内错误路由：wrongFunction 码（4001/4023/1005 之外的语义
+			// 见下）换 function 重试同账号一次；1005 plan → 冷却后换号；
+			// 其他 → 累计错误换号。成功后目录里该模型的 function 归属更新。
+			se, handled := h.serveChat(w, acct.UID, rc, peek.Stream)
+			if handled {
+				return
+			}
+			if se != nil && upstream.WrongFunctionCode(se.Code) && se.Kind() != upstream.ErrPlanLimit {
+				if next, ok2 := h.nextFunction(cat, configName, curFn); ok2 {
+					curFn = next
+					continue
+				}
+			}
+			if se != nil {
+				h.routeStreamError(acct.UID, se)
+			}
+			break
 		}
-		h.cfg.Pool.NoteSuccess(acct.UID)
-		writeJSON(w, http.StatusOK, resp)
-		return
 	}
 	msg := "all accounts unavailable (cooling/disabled)"
 	if lastErr != nil {
@@ -517,6 +538,145 @@ func (h *Handler) handleStreamError(uid string, se *upstream.SOLOStreamError) {
 		h.cfg.Pool.Cooldown(uid, pool.CoolPlan, h.cfg.PlanCooldown, "plan 权益不足")
 	default:
 		h.cfg.Pool.NoteError(uid, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+	}
+}
+
+// routeStreamError 流内业务错误（非流式聚合/窥探返回）→ pool 冷却路由：
+// 1005 plan → 长冷却；其余 → 累计错误。与 handleStreamError 同状态机，只是
+// 调用方已拿到 se。
+func (h *Handler) routeStreamError(uid string, se *upstream.SOLOStreamError) {
+	h.handleStreamError(uid, se)
+}
+
+// ---------------------------------------------------------------------------
+// 目录辅助（多 function / Max / multimodal / reasoning levels）
+// ---------------------------------------------------------------------------
+
+// catalogOf 从 FetchModels 的动态列表重建目录查询（缓存命中时零成本）。
+// 目录不可用 → nil（调用方全部按默认）。
+func (h *Handler) catalogOf(infos []upstream.ModelInfo) upstream.Catalog {
+	if len(infos) == 0 {
+		return nil
+	}
+	return upstream.CatalogFrom(infos)
+}
+
+// chatFunction 模型的目录 function（列出者）；目录不可用 → 空（走默认）。
+func (h *Handler) chatFunction(cat upstream.Catalog, id string) string {
+	if cat == nil {
+		return ""
+	}
+	return cat.FunctionOf(id)
+}
+
+// maxModeOf 模型的 Max 模式（<id>-max 请求时）；无 → nil。
+func (h *Handler) maxModeOf(cat upstream.Catalog, id string) *upstream.MaxMode {
+	if cat == nil {
+		return nil
+	}
+	return cat.MaxOf(id)
+}
+
+// seesOf 模型是否收图（目录 multimodal）；目录没说 → nil（按收图透传，
+// 插件 sight.get 缺省口径）。
+func (h *Handler) seesOf(cat upstream.Catalog, id string) *bool {
+	if cat == nil {
+		return nil
+	}
+	return cat.SeesOf(id)
+}
+
+// levelsOf 模型承载的 reasoning 等级；目录不可用 → 空（不发 effort）。
+func (h *Handler) levelsOf(cat upstream.Catalog, id string) []string {
+	if cat == nil {
+		return nil
+	}
+	return cat.LevelsOf(id)
+}
+
+// nextFunction wrongFunction 回退的下一个 function：目录顺序里换一个
+// 未试过的（插件 fns 列表轮换同口径）。
+func (h *Handler) nextFunction(cat upstream.Catalog, id, cur string) (string, bool) {
+	for _, fn := range upstream.ChatFunctions() {
+		if fn != cur {
+			return fn, true
+		}
+	}
+	return "", false
+}
+
+// serveChat 提交响应。流式请求（peekStream）不做窥探重试：错误事件原样
+// 透传给客户端（SSE 恒 200），仅经回调冷却账号。非流式聚合先窥探首个
+// event:error（插件 first(it) 口径）交给调用方路由——wrongFunction 码换
+// function 重试、1005 plan 冷却换号——返回 handled=false；窥探到的字节与
+// bufio 缓冲随 rest 回放给消费者，不能丢。
+func (h *Handler) serveChat(w http.ResponseWriter, uid string, rc io.ReadCloser, peekStream bool) (se *upstream.SOLOStreamError, handled bool) {
+	if peekStream {
+		h.cfg.Pool.NoteSuccess(uid)
+		_ = upstream.StreamWithError(w, rc, func(sse *upstream.SOLOStreamError) {
+			h.handleStreamError(uid, sse)
+		})
+		rc.Close()
+		return nil, true
+	}
+	replay, errEv, rest := peekFirstEvent(rc)
+	if errEv != nil {
+		rc.Close()
+		return errEv, false
+	}
+	body := io.MultiReader(bytes.NewReader(replay), rest)
+	h.cfg.Pool.NoteSuccess(uid)
+	resp, err := upstream.Aggregate(body)
+	rc.Close()
+	if err != nil {
+		var ase *upstream.SOLOStreamError
+		if errors.As(err, &ase) {
+			return ase, false
+		}
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
+		return nil, true
+	}
+	writeJSON(w, http.StatusOK, resp)
+	return nil, true
+}
+
+// peekFirstEvent 读首个 SSE 事件（至首个空行）：replay 是已读的原始字节
+//（须回放给消费者），rest 是持有 bufio 缓冲的剩余流；event:error → se。
+func peekFirstEvent(rc io.Reader) (replay []byte, se *upstream.SOLOStreamError, rest io.Reader) {
+	br := bufio.NewReaderSize(rc, 64<<10)
+	var buf bytes.Buffer
+	var event, data string
+	flush := func() *upstream.SOLOStreamError {
+		if data == "" {
+			return nil
+		}
+		ev, err := upstream.ParseSOLOLine(event, data)
+		if err != nil || ev == nil {
+			return nil
+		}
+		if ev.Event == "error" {
+			return &upstream.SOLOStreamError{Code: ev.ErrorCode, Msg: ev.ErrorMessage}
+		}
+		return nil
+	}
+	for {
+		line, err := br.ReadString('\n')
+		buf.WriteString(line)
+		trimmed := strings.TrimRight(line, "\r\n")
+		switch {
+		case trimmed == "":
+			return buf.Bytes(), flush(), br
+		case strings.HasPrefix(trimmed, "event:"):
+			event = strings.TrimSpace(strings.TrimPrefix(trimmed, "event:"))
+		case strings.HasPrefix(trimmed, "data:"):
+			if data != "" {
+				data += "\n"
+			}
+			data += strings.TrimPrefix(strings.TrimPrefix(trimmed, "data:"), " ")
+		}
+		if err != nil {
+			return buf.Bytes(), flush(), br
+		}
 	}
 }
 

@@ -31,6 +31,7 @@ func SOLOHeaders(req *http.Request, a *auth.Auth, stream bool) {
 	req.Header.Set("X-Ide-Version", IdeVersion)
 	req.Header.Set("X-Ide-Version-Code", IdeVersionCode)
 	req.Header.Set("X-App-Version-Code", IdeVersionCode)
+	req.Header.Set("X-Request-Id", randomRequestID())
 	req.Header.Set("X-Ide-Version-Type", "stable")
 	req.Header.Set("X-Device-Type", "windows")
 	req.Header.Set("X-OS-Version", OSVersion)

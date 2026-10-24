@@ -141,6 +141,18 @@ func scanLine(st *sseState, line string) *SOLOEvent {
 // Aggregate 读取完整 SOLO SSE，聚合 response + reasoning + tool_calls + usage，
 // 产出单个 OpenAI chat.completion（非流式）。
 func Aggregate(r io.Reader) (map[string]any, error) {
+	return AggregateWithTools(r, AggregateOptions{})
+}
+
+// AggregateOptions Aggregate 的可选项：请求声明的 tools。
+type AggregateOptions struct {
+	Tools []ToolDef
+}
+
+// AggregateWithTools 同 Aggregate，另外把文本输出过 TextTools（请求声明了 tools 时），
+// 推理过 Thoughts 去重。截断/读不出的文本调用不是答案：返回 *ToolTextError（plugins#38），
+// 调用方以 502 回给上层重试。
+func AggregateWithTools(r io.Reader, opts AggregateOptions) (map[string]any, error) {
 	br := bufio.NewReaderSize(r, 64*1024)
 	var (
 		id           string
@@ -153,6 +165,43 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		upstreamErr  error
 	)
 	st := &sseState{}
+	tt := NewTextTools(opts.Tools)
+	th := &Thoughts{}
+	useTT := len(opts.Tools) > 0
+	ttDone := false
+	flushTT := func() error {
+		if ttDone || !useTT {
+			return nil
+		}
+		ttDone = true
+		res := tt.Push("", true)
+		if res.Reasoning != "" {
+			if r := th.Add(res.Reasoning); r != "" {
+				reasoning.WriteString(r)
+			}
+		}
+		content.WriteString(res.Text)
+		for _, c := range res.Calls {
+			idx := len(toolOrder)
+			toolCalls[idx] = map[string]any{
+				"index": idx,
+				"id":    ttCallID(),
+				"type":  "function",
+				"function": map[string]any{
+					"name":      c.Name,
+					"arguments": c.Arguments,
+				},
+			}
+			toolOrder = append(toolOrder, idx)
+		}
+		if res.Error != "" {
+			return &ToolTextError{Msg: res.Error}
+		}
+		return nil
+	}
+	fail := func(err error) (map[string]any, error) {
+		return nil, err
+	}
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil && err != io.EOF {
@@ -165,14 +214,49 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 					// metadata 无 id 可用，保留为空，末尾补 chatcmpl。
 				}
 			case "output":
-				content.WriteString(ev.Response)
-				reasoning.WriteString(ev.Reasoning)
+				if ev.Reasoning != "" {
+					if r := th.Add(ev.Reasoning); r != "" {
+						reasoning.WriteString(r)
+					}
+				}
+				if ev.Response != "" {
+					if useTT {
+						res := tt.Push(ev.Response, false)
+						if res.Reasoning != "" {
+							if r := th.Add(res.Reasoning); r != "" {
+								reasoning.WriteString(r)
+							}
+						}
+						content.WriteString(res.Text)
+						for _, c := range res.Calls {
+							idx := len(toolOrder)
+							toolCalls[idx] = map[string]any{
+								"index": idx,
+								"id":    ttCallID(),
+								"type":  "function",
+								"function": map[string]any{
+									"name":      c.Name,
+									"arguments": c.Arguments,
+								},
+							}
+							toolOrder = append(toolOrder, idx)
+						}
+						if res.Error != "" {
+							return fail(&ToolTextError{Msg: res.Error})
+						}
+					} else {
+						content.WriteString(ev.Response)
+					}
+				}
 				mergeToolCallJSON(toolCalls, &toolOrder, ev.ToolCalls)
 			case "token_usage":
 				usage = ev.Usage
 			case "done":
+				if err := flushTT(); err != nil {
+					return nil, err
+				}
 				if ev.FinishReason != "" {
-					finishReason = ev.FinishReason
+					finishReason = finishOf(ev.FinishReason)
 				}
 			case "error":
 				upstreamErr = &SOLOStreamError{Code: ev.ErrorCode, Msg: ev.ErrorMessage}
@@ -184,6 +268,9 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 	}
 	if upstreamErr != nil {
 		return nil, upstreamErr
+	}
+	if err := flushTT(); err != nil {
+		return nil, err
 	}
 	if id == "" {
 		id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
@@ -302,6 +389,13 @@ func sortInts(a []int) {
 	}
 }
 
+// StreamOptions 流式转换的可选项：请求声明的 tools（TextTools 只在声明了工具时启用，
+// 与文本协议调用匹配）与上游错误回调。
+type StreamOptions struct {
+	Tools []ToolDef
+	OnErr func(*SOLOStreamError)
+}
+
 // Stream 流式转换：SOLO SSE → OpenAI SSE chunk，每 chunk flush，保证至少一个 [DONE]。
 // 调用方必须先设置过 status 200；本函数自设 SSE headers。
 func Stream(w http.ResponseWriter, r io.Reader) error {
@@ -316,6 +410,13 @@ func StreamWithError(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamE
 
 // streamOpts Stream 的可选参数版本。
 func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)) error {
+	return streamWithOpts(w, r, StreamOptions{OnErr: onErr})
+}
+
+// streamWithOpts streamOpts 的完整可选项版本：请求声明了 tools 时，文本输出先过
+// TextTools（index.mjs 行为：文本协议调用读回为真调用，推理去重）；出现原生
+// tool_call 后 TextTools 收尾，其余文本原样透传。
+func streamWithOpts(w http.ResponseWriter, r io.Reader, opts StreamOptions) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -368,6 +469,67 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 		return nil
 	}
 
+	tt := NewTextTools(opts.Tools)
+	th := &Thoughts{}
+	useTT := len(opts.Tools) > 0
+	sawNative := false
+	ttDone := false
+	ttFailed := false
+	writeError := func(msg string) error {
+		if _, err := io.WriteString(w, "event: error\n"+"data: "+jsonEscape(msg)+"\n\n"); err != nil {
+			return err
+		}
+		return writeDONE()
+	}
+	// emitTTCall 把一次读出的文本调用写成 OpenAI tool_calls delta。
+	emitTTCall := func(c TTCall, idx int) error {
+		delta := map[string]any{
+			"tool_calls": []map[string]any{{
+				"index": idx,
+				"id":    ttCallID(),
+				"type":  "function",
+				"function": map[string]any{
+					"name":      c.Name,
+					"arguments": c.Arguments,
+				},
+			}},
+		}
+		return writeChunk(delta, "")
+	}
+	// flushTT TextTools 收尾：流已尽时未整的块按截断或收尾读；错误注入事件流。
+	flushTT := func() error {
+		if ttDone || !useTT {
+			return nil
+		}
+		ttDone = true
+		res := tt.Push("", true)
+		if res.Reasoning != "" {
+			if rr := th.Add(res.Reasoning); rr != "" {
+				if err := writeChunk(map[string]any{"reasoning_content": rr}, ""); err != nil {
+					return err
+				}
+			}
+		}
+		if res.Text != "" {
+			if err := writeChunk(map[string]any{"content": res.Text}, ""); err != nil {
+				return err
+			}
+		}
+		for i, c := range res.Calls {
+			if err := emitTTCall(c, i); err != nil {
+				return err
+			}
+		}
+		if res.Error != "" {
+			ttFailed = true
+			if err := writeError(res.Error); err != nil {
+				return err
+			}
+			sawDone = true
+		}
+		return nil
+	}
+
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil && err != io.EOF {
@@ -377,11 +539,43 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 			switch ev.Event {
 			case "output":
 				delta := map[string]any{}
-				if ev.Response != "" {
-					delta["content"] = ev.Response
-				}
 				if ev.Reasoning != "" {
-					delta["reasoning_content"] = ev.Reasoning
+					if rr := th.Add(ev.Reasoning); rr != "" {
+						delta["reasoning_content"] = rr
+					}
+				}
+				if ev.Response != "" {
+					if useTT && !sawNative {
+						res := tt.Push(ev.Response, false)
+						if res.Reasoning != "" {
+							if rr := th.Add(res.Reasoning); rr != "" {
+								delta["reasoning_content"] = rr
+							}
+						}
+						if res.Text != "" {
+							delta["content"] = res.Text
+						}
+						if len(res.Calls) > 0 {
+							if err := writeChunk(delta, ""); err != nil {
+								return err
+							}
+							delta = map[string]any{}
+							for i, c := range res.Calls {
+								if err := emitTTCall(c, i); err != nil {
+									return err
+								}
+							}
+						}
+						if res.Error != "" {
+							if err := writeError(res.Error); err != nil {
+								return err
+							}
+							sawDone = true
+							break
+						}
+					} else {
+						delta["content"] = ev.Response
+					}
 				}
 				if len(ev.ToolCalls) > 0 && string(ev.ToolCalls) != "null" {
 					var tc []map[string]any
@@ -401,6 +595,13 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 						delta["tool_calls"] = tc
 					}
 				}
+				if len(ev.ToolCalls) > 0 && string(ev.ToolCalls) != "null" && useTT && !sawNative {
+					// 原生 function_call 出现：TextTools 收尾（plugins 行为：原生聚合已有实现保留）。
+					sawNative = true
+					if err := flushTT(); err != nil {
+						return err
+					}
+				}
 				if len(delta) > 0 {
 					if err := writeChunk(delta, ""); err != nil {
 						return err
@@ -409,7 +610,18 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 			case "token_usage":
 				pendingUsage = ev.Usage
 			case "done":
-				if err := writeChunk(map[string]any{}, ev.FinishReason); err != nil {
+				if err := flushTT(); err != nil {
+					return err
+				}
+				if ttFailed {
+					// 文本调用截断/读不出已以错误结束（plugins#38）。
+					return nil
+				}
+				finish := ev.FinishReason
+				if m := finishOf(finish); m != "" {
+					finish = m
+				}
+				if err := writeChunk(map[string]any{}, finish); err != nil {
 					return err
 				}
 				if err := writeDONE(); err != nil {
@@ -419,8 +631,8 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 			case "error":
 				// 上游业务错误：回调 + 写一条 error 事件 + [DONE]。
 				se := &SOLOStreamError{Code: ev.ErrorCode, Msg: ev.ErrorMessage}
-				if onErr != nil {
-					onErr(se)
+				if opts.OnErr != nil {
+					opts.OnErr(se)
 				}
 				msg := fmt.Sprintf("solo error code=%d msg=%s", ev.ErrorCode, ev.ErrorMessage)
 				if _, err := io.WriteString(w, "event: error\n"+"data: "+jsonEscape(msg)+"\n\n"); err != nil {
@@ -437,7 +649,13 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 		}
 	}
 	if !sawDone {
-		// 幂等兜底：上游中断（无 done）仍写 [DONE]。
+		// 幂等兜底：上游中断（无 done）仍先收尾 TextTools，再写 [DONE]。
+		if err := flushTT(); err != nil {
+			return err
+		}
+		if ttFailed {
+			return nil
+		}
 		return writeDONE()
 	}
 	return nil

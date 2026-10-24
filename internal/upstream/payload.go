@@ -22,6 +22,56 @@ import (
 //  4. function: 固定 "solo_work_lite"
 //  5. tools/tool_choice: 归一化（"none" 删 tools；auto/required 保留；function 提取 name）
 func PrepareBody(src []byte, session, who string) []byte {
+	return PrepareBodyFn(src, "", session, who)
+}
+
+// ChatOpts 是聊天请求体改写的目录依赖项（插件 chatBody 的 fn/modelName/most/
+// max/sees/levels 形参）。
+type ChatOpts struct {
+	Function string // 本次请求的 function；空 → Function 默认
+	Model    string // config_name / model（已映射好的请求模型 id）
+	// Max 非 nil → Max 模式请求（<id>-max）：config_name/model 用 base id，
+	// model_name 用 __max 内部名，max_tokens 恒设，
+	// user_message_context.model_info.prompt_max_tokens = 窗口 − max_tokens。
+	Max *MaxMode
+	// Sees 模型是否收图（目录 multimodal）；nil = 目录没说 → 透传。
+	Sees *bool
+	// Levels 模型承载的 reasoning 等级（low/high/xhigh 口径）；按它翻译
+	// 请求的 reasoning_effort/reasoningEffort，条目没说不发。
+	Levels []string
+}
+
+// MaxMode 一个模型的 Max 模式。
+type MaxMode struct {
+	Base   string // 实际发上游的 config_name（base 模型 id）
+	Name   string // __max 内部模型名（请求体的 model_name）
+	Most   int64  // __max 的 max_tokens
+	Window int64  // Max 窗口（context_window_tokens.max）
+}
+
+// PrepareBodyFn 带 function 与目录信息的改写。
+func PrepareBodyFn(src []byte, fn string, session, who string) []byte {
+	return PrepareBodyOpts(src, ChatOpts{Function: fn, Model: configNameOf(src)}, session, who)
+}
+
+// configNameOf 取请求体里已映射好的 model 字段。
+func configNameOf(src []byte) string {
+	var peek struct {
+		Model string `json:"model"`
+	}
+	if json.Unmarshal(src, &peek) != nil {
+		return ""
+	}
+	return peek.Model
+}
+
+// PrepareBodyOpts 完整改写（插件 chatBody 口径）：
+//
+//	OpenAI: {model, messages, stream, tools, tool_choice, ...}
+//	SOLO:   {messages, function, stream:true, config_name, model,
+//	         [model_name], [reasoning_effort], [max_tokens],
+//	         [user_message_context.model_info.prompt_max_tokens]}
+func PrepareBodyOpts(src []byte, opts ChatOpts, session, who string) []byte {
 	if len(src) == 0 {
 		return src
 	}
@@ -30,12 +80,17 @@ func PrepareBody(src []byte, session, who string) []byte {
 		return src
 	}
 	obj["stream"] = true
-	obj["function"] = Function
+	obj["function"] = opts.Function
+	if obj["function"] == "" {
+		obj["function"] = Function
+	}
 
 	// 消息整形（插件 traeMessages 口径）：同角色折叠、工具往返整形、无主
 	// 结果回退 user 文本、空结果补占位；并派生 session_id（Trae 按它归档
 	// 对话，避免一次多步请求被拆成多条无标题对话）。
-	reshapeMessages(obj)
+	// sees 由目录按模型传入：仅目录显式 multimodal=false 的模型图片替换
+	// 占位文本；目录没说或不可用按收图透传（插件 sight.get 缺省口径）。
+	reshapeMessages(obj, opts.Sees == nil || *opts.Sees)
 	msgs, _ := obj["messages"].([]any)
 	if conv := conversationID(msgs, session, who); conv != "" {
 		obj["session_id"] = conv
@@ -43,13 +98,58 @@ func PrepareBody(src []byte, session, who string) []byte {
 		obj["session_id"] = newRequestUUID()
 	}
 
-	model, _ := obj["model"].(string)
-	model = strings.TrimSpace(model)
-	if model == "" {
-		model = DefaultConfigName
+	// config_name / model：Max 模式用 base id；model_name 用 __max 内部名。
+	config := opts.Model
+	if opts.Max != nil && opts.Max.Base != "" {
+		config = opts.Max.Base
+		if opts.Max.Name != "" {
+			obj["model_name"] = opts.Max.Name
+		}
 	}
-	obj["config_name"] = model
-	obj["model"] = model
+	if config == "" {
+		config = DefaultConfigName
+	}
+	obj["config_name"] = config
+	obj["model"] = config
+
+	// reasoning_effort：按目录条目的 reasoning_effort_config 翻译
+	// （low→light、high→high、xhigh→extra_high）；条目没说或等级不被承载
+	// → 不发（请求带来的字段一并删掉）。
+	if effort := effortOf(opts.Levels, reasoningEffortOf(obj)); effort != "" {
+		obj[effortSend] = effort
+	} else {
+		delete(obj, effortSend)
+	}
+	delete(obj, "reasoningEffort")
+
+	// max_tokens：Max 模式恒设（插件 3027-3043），否则透传请求值；
+	// Max 模式补 user_message_context.model_info.prompt_max_tokens。
+	most := int64(0)
+	if opts.Max != nil {
+		most = opts.Max.Most
+	}
+	asked := maxTokensOf(obj)
+	if asked > 0 {
+		if most > 0 && asked > most {
+			asked = most
+		}
+		obj[maxTokenLimit] = asked
+	} else if opts.Max != nil && most > 0 {
+		obj[maxTokenLimit] = most
+	}
+	delete(obj, "max_completion_tokens")
+	if opts.Max != nil && opts.Max.Window > 0 {
+		window := opts.Max.Window
+		mt, _ := obj[maxTokenLimit].(int64)
+		if mt == 0 {
+			if f, ok := obj[maxTokenLimit].(float64); ok {
+				mt = int64(f)
+			}
+		}
+		obj["user_message_context"] = map[string]any{
+			"model_info": map[string]any{promptCap: window - mt},
+		}
+	}
 
 	normalizeToolChoice(obj)
 	normalizeTools(obj)
@@ -58,6 +158,36 @@ func PrepareBody(src []byte, session, who string) []byte {
 		return src
 	}
 	return out
+}
+
+// reasoningEffortOf 取请求的 reasoning_effort / reasoningEffort（camelCase 兼容）。
+func reasoningEffortOf(obj map[string]any) string {
+	if s, ok := obj[effortSend].(string); ok {
+		return s
+	}
+	s, _ := obj["reasoningEffort"].(string)
+	return s
+}
+
+// maxTokensOf 取请求的 max_tokens / max_completion_tokens（>0 才有效）。
+func maxTokensOf(obj map[string]any) int64 {
+	for _, k := range []string{"max_tokens", "max_completion_tokens"} {
+		switch v := obj[k].(type) {
+		case float64:
+			if v > 0 {
+				return int64(v)
+			}
+		case int64:
+			if v > 0 {
+				return v
+			}
+		case int:
+			if v > 0 {
+				return int64(v)
+			}
+		}
+	}
+	return 0
 }
 
 // newRequestUUID 生成 v4 UUID 形状的逐请求 id（session_id 的兜底形态）。

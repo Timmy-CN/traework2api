@@ -98,10 +98,14 @@ func (s *Scheduler) RunCheckinNow() {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
-		// 签到设备门控（PR #9）：凭证缺独立签到设备标识时，尝试从本机已登录的
-		// 官方客户端自动读取并写回凭证（Docker 容器内读不到宿主机客户端数据，
-		// 会走到下面的跳过分支）。
-		if a.CheckinDeviceID == "" {
+		// 签到门控：9095（本设备今日已签，done 口径）/ 9074（需在 CN app 内签）
+		// 当天不可领取，当天后续轮次跳过签到，但状态/额度查询照常，次日自动恢复。
+		if s.cfg.Pool.CheckinIneligibleToday(st.UID) {
+			log.Printf("checkin %s: skip, 当天不可领取（9095/9074），次日恢复", st.UID)
+		} else if a.CheckinDeviceID == "" {
+			// 签到设备门控（PR #9）：凭证缺独立签到设备标识时，尝试从本机已登录的
+			// 官方客户端自动读取并写回凭证（Docker 容器内读不到宿主机客户端数据，
+			// 会走到下面的跳过分支）。
 			if id, brand, typ, ok := auth.DetectLocalCheckinDevice(); ok {
 				a.CheckinDeviceID, a.CheckinDeviceBrand, a.CheckinDeviceType = id, brand, typ
 				if err := a.SaveAtomic(); err != nil {
@@ -113,10 +117,10 @@ func (s *Scheduler) RunCheckinNow() {
 		}
 		if a.CheckinDeviceID == "" {
 			// 凭证缺少独立签到设备标识且本机检测不到官方客户端：多账号签到
-			// 要求各账号使用不同的设备 ID，缺字段时明确跳过并说明，不发无设备头
-			// 的无效请求，也不生成随机假 ID（上游无法识别，签到永远不会生效）。
+			// 要求各账号使用不同的设备 ID，缺字段时明确跳过并说明，不发无设备头的
+			// 无效请求，也不生成随机假 ID（上游无法识别，签到永远不会生效）。
 			log.Printf("checkin %s: skip, 缺签到设备ID且本机未检测到官方客户端（在已登录官方客户端的机器上跑 signin.sh 可自动读取并写回凭证；手动获取见 README「签到设备ID」）", st.UID)
-		} else {
+		} else if !s.cfg.Pool.CheckinIneligibleToday(st.UID) {
 			// 签到前兜底刷新：凌晨预刷新失败时，避免拿着过期 token 签到。
 			if a.NeedsRefresh(2 * time.Hour) {
 				if err := s.cfg.Upstream.RefreshToken(a); err != nil {
@@ -135,7 +139,18 @@ func (s *Scheduler) RunCheckinNow() {
 			case errors.Is(err, upstream.ErrCheckinDisabled):
 				log.Printf("checkin %s: disabled", st.UID)
 			default:
-				log.Printf("checkin %s: %v", st.UID, err)
+				var ce *upstream.CheckinError
+				if errors.As(err, &ce) && ce.Code == upstream.CodeCheckinIneligibleDevice {
+					// 本设备今日已签：done 口径，记为当天不可领取。
+					s.cfg.Pool.MarkCheckinIneligible(st.UID)
+					log.Printf("checkin %s: already checked in on this device (9095)", st.UID)
+				} else if errors.As(err, &ce) && ce.Code == upstream.CodeCheckinInAppOnly {
+					// 需在 CN app 内签：当天不再问。
+					s.cfg.Pool.MarkCheckinIneligible(st.UID)
+					log.Printf("checkin %s: ineligible, 需在 Trae CN app 内签到 (9074)", st.UID)
+				} else {
+					log.Printf("checkin %s: %v", st.UID, err)
+				}
 			}
 		}
 		// 查积分 + 解冻
