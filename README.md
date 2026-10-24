@@ -58,6 +58,20 @@ TRAE 登录页强制回调 `127.0.0.1`，但浏览器与服务器不需要同机
 #    → 落盘 auths/trae-{uid}.json → 自动签到 + 查积分 → 重启容器加载新账号
 ```
 
+### 消息整形 / 会话 id / 设备绑定刷新
+
+- **消息整形**（与插件 traeMessages 同口径）：Trae 不接受同角色连续两条消息——
+  assistant 文本折叠进其调用 turn、并行调用并成一列；无 name 的调用连同其
+  结果整组丢弃；无主结果回退为 user 文本；空结果补 `(no output)`（上游 4027）。
+- **会话 id**：每条请求带 `session_id`（v4 UUID，按账号身份派生），Trae 按它
+  归档对话——多步工具调用不再被拆成多条无标题对话；客户端可用 `X-Session-Id`
+  头点名会话（截 128 字符）。
+- **设备绑定刷新**：token 续期先走 `/trae/api/v3/oauth/ExchangeToken` 的设备
+  绑定通道（`DeviceProof` = ECDSA P-256 签名，密钥登录后生成并随凭证持久化），
+  **不消耗 refresh_token、不踢该账号的其他客户端**；两条 client 身份
+  （SOLO_PC → IDE_PC）依次尝试，全败回退通用轮换通道，且续期撞
+  「has been used」时会采纳磁盘上的最新凭证重试一次。
+
 ## 本机运行（非 Docker）
 
 ```bash

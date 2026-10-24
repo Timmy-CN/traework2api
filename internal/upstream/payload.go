@@ -2,7 +2,10 @@
 package upstream
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -18,7 +21,7 @@ import (
 //  3. model → config_name + model
 //  4. function: 固定 "solo_work_lite"
 //  5. tools/tool_choice: 归一化（"none" 删 tools；auto/required 保留；function 提取 name）
-func PrepareBody(src []byte) []byte {
+func PrepareBody(src []byte, session, who string) []byte {
 	if len(src) == 0 {
 		return src
 	}
@@ -29,58 +32,15 @@ func PrepareBody(src []byte) []byte {
 	obj["stream"] = true
 	obj["function"] = Function
 
-	if msgs, ok := obj["messages"].([]any); ok {
-		for _, mi := range msgs {
-			m, ok := mi.(map[string]any)
-			if !ok {
-				continue
-			}
-			content, present := m["content"]
-			role, _ := m["role"].(string)
-
-			// assistant 消息回传 tool_calls: OpenAI function → 上游 function_call
-			if role == "assistant" {
-				if tcs, ok := m["tool_calls"].([]any); ok {
-					kept := make([]any, 0, len(tcs))
-					for _, tci := range tcs {
-						tc, ok := tci.(map[string]any)
-						if !ok {
-							continue
-						}
-						// OpenAI: function{name, arguments} → 上游 SOLO: function_call{name, arguments}
-						if fn, ok := tc["function"].(map[string]any); ok {
-							tc["function_call"] = fn
-							delete(tc, "function")
-						}
-						// 上游要求 FunctionCall.Name 必填: 无 name 的 tool_call 剔除
-						if fc, ok := tc["function_call"].(map[string]any); ok {
-							name, _ := fc["name"].(string)
-							if strings.TrimSpace(name) == "" {
-								continue
-							}
-						}
-						kept = append(kept, tc)
-					}
-					if len(kept) == 0 {
-						delete(m, "tool_calls")
-					} else {
-						m["tool_calls"] = kept
-					}
-				}
-			}
-
-			if !present || content == nil {
-				continue // 无 content 的消息(如纯 tool_calls assistant 已转换完)保留字段但跳过 content 改写
-			}
-			switch c := content.(type) {
-			case string:
-				m["content"] = []any{
-					map[string]any{"type": "text", "text": c},
-				}
-			default:
-				// 已是数组 → 透传（兼容多模态，未实测，保守透传）
-			}
-		}
+	// 消息整形（插件 traeMessages 口径）：同角色折叠、工具往返整形、无主
+	// 结果回退 user 文本、空结果补占位；并派生 session_id（Trae 按它归档
+	// 对话，避免一次多步请求被拆成多条无标题对话）。
+	reshapeMessages(obj)
+	msgs, _ := obj["messages"].([]any)
+	if conv := conversationID(msgs, session, who); conv != "" {
+		obj["session_id"] = conv
+	} else {
+		obj["session_id"] = newRequestUUID()
 	}
 
 	model, _ := obj["model"].(string)
@@ -98,6 +58,16 @@ func PrepareBody(src []byte) []byte {
 		return src
 	}
 	return out
+}
+
+// newRequestUUID 生成 v4 UUID 形状的逐请求 id（session_id 的兜底形态）。
+func newRequestUUID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	h := hex.EncodeToString(b)
+	return fmt.Sprintf("%s-%s-%s-%s-%s", h[0:8], h[8:12], h[12:16], h[16:20], h[20:32])
 }
 
 // DefaultConfigName 默认模型（glm-5.2，实测可用）。

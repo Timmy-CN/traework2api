@@ -32,10 +32,15 @@ type Auth struct {
 	CheckinDeviceID    string // 签到 x-device-id
 	CheckinDeviceBrand string // 签到 x-device-brand
 	CheckinDeviceType  string // 签到 x-device-type
-	UID                string
-	EnterpriseID       string
-	Nickname           string
-	FilePath           string // 落盘路径；refresh 后原子写回
+	// DevicePublicKey/DevicePrivateKey 是登录后生成的 ECDSA P-256 密钥对
+	//（SPKI/PKCS8 PEM）：设备绑定刷新（不消耗 refresh_token、不踢其他客户端）
+	// 用私钥签 DeviceProof，公钥随 DeviceInfo 上报。缺失时刷新路径懒生成。
+	DevicePublicKey  string
+	DevicePrivateKey string
+	UID              string
+	EnterpriseID     string
+	Nickname         string
+	FilePath         string // 落盘路径；refresh 后原子写回
 }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加写锁。
@@ -95,6 +100,8 @@ func parseNested(raw []byte) (*Auth, error) {
 			CheckinDeviceID    string `json:"checkinDeviceId"`
 			CheckinDeviceBrand string `json:"checkinDeviceBrand"`
 			CheckinDeviceType  string `json:"checkinDeviceType"`
+			DevicePublicKey   string `json:"devicePublicKey"`
+			DevicePrivateKey  string `json:"devicePrivateKey"`
 		} `json:"auth"`
 		Account struct {
 			UID          string `json:"uid"`
@@ -216,6 +223,8 @@ func (a *Auth) saveAtomicLocked() error {
 			"checkinDeviceId":    a.CheckinDeviceID,
 			"checkinDeviceBrand": a.CheckinDeviceBrand,
 			"checkinDeviceType":  a.CheckinDeviceType,
+			"devicePublicKey":    a.DevicePublicKey,
+			"devicePrivateKey":   a.DevicePrivateKey,
 		},
 		"account": map[string]any{
 			"uid":          a.UID,
@@ -232,6 +241,18 @@ func (a *Auth) saveAtomicLocked() error {
 		return err
 	}
 	return os.Rename(tmp, a.FilePath)
+}
+
+// DeviceKeys 返回设备绑定刷新的密钥对（PEM）；缺失返回空串（调用方懒生成）。
+// 调用方通常已持有 a.mu 写锁（refreshLocked），这里不重复加锁。
+func (a *Auth) DeviceKeys() (pub, priv string) {
+	return a.DevicePublicKey, a.DevicePrivateKey
+}
+
+// SetDeviceKeys 记录设备密钥对（随下次 SaveAtomic 持久化）。
+func (a *Auth) SetDeviceKeys(pub, priv string) {
+	a.DevicePublicKey = pub
+	a.DevicePrivateKey = priv
 }
 
 // LoadDir 扫描 dir 下 trae-*.json。解析失败的文件静默跳过（启动日志由调用方统计）。

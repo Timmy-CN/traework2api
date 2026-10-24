@@ -3,6 +3,7 @@
 package upstream
 
 import (
+	"context"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -224,6 +225,20 @@ func (c *Client) refreshLocked(a *auth.Auth) error {
 	if strings.TrimSpace(a.RefreshToken) == "" {
 		return fmt.Errorf("no refreshToken")
 	}
+	// 先设备绑定刷新（插件 boundExchange 口径）：不消耗 refresh_token、不踢
+	// 该账号的其他客户端；设备密钥缺失时懒生成并随本次写回持久化。全部失败
+	// 回退到下面的通用轮换通道（会轮换并作废旧 refresh_token）。
+	if access, refresh, expires, derr := c.deviceBoundExchange(context.Background(), a); derr == nil {
+		a.AccessToken = access
+		a.RefreshToken = refresh
+		if expires > 0 {
+			a.ExpiresAt = expires
+		}
+		log.Printf("device-bound refresh ok uid=%s", a.UID)
+		return nil
+	} else {
+		log.Printf("device-bound refresh failed uid=%s, falling back to exchange: %v", a.UID, derr)
+	}
 	host := a.ApiHost
 	if host == "" {
 		host = c.oauthBase()
@@ -285,8 +300,8 @@ func normalizeExpiresAt(v int64) int64 {
 // ChatStream 发 llm_utils_chat 请求并返回原始 SSE body 流（调用方负责 Close）。
 // 非 2xx 时 rc 为 nil、body 为上游响应体（供调用方 Classify）、err 为 nil；
 // 只有传输层失败才返回 err。
-func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error) {
-	req, err := http.NewRequest(http.MethodPost, c.agentBase()+EpChat, bytes.NewReader(PrepareBody(body)))
+func (c *Client) ChatStream(a *auth.Auth, body []byte, session, who string) (rc io.ReadCloser, status int, respBody []byte, err error) {
+	req, err := http.NewRequest(http.MethodPost, c.agentBase()+EpChat, bytes.NewReader(PrepareBody(body, session, who)))
 	if err != nil {
 		return nil, 0, nil, err
 	}

@@ -426,7 +426,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			_ = acct.SaveAtomic()
 		}
 
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body)
+		// 会话 id 来源：客户端的 X-Session-Id / X-Magpie-Trae-Session（截 128 字符，
+		// 插件 sessionOf 同口径）；who = 账号身份，防止 Trae 把一个对话记到别的账号头上。
+		session := strings.TrimSpace(r.Header.Get(upstream.SESSION_HEADER))
+		if session == "" {
+			session = strings.TrimSpace(r.Header.Get(upstream.SESSION_HEADER_ALT))
+		}
+		if len(session) > 128 {
+			session = session[:128]
+		}
+		who := acct.UID
+		if who == "" {
+			who = acct.Nickname
+		}
+		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body, session, who)
 		if terr != nil {
 			lastErr = terr
 			h.cfg.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
