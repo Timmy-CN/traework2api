@@ -81,6 +81,7 @@ fi
 
 # ─── 解析回调 → ExchangeToken → GetUserInfo（内嵌 Python）───
 RESULT=$(CLIENT_ID="$CLIENT_ID" API_HOST="$API_HOST" APP_VERSION="$APP_VERSION" \
+MODEL_HOST="$MODEL_HOST" AUTH_HOST="$AUTH_HOST" \
 MACHINE_ID="$MACHINE_ID" DEVICE_ID="$DEVICE_ID" CALLBACK_URL="$callback_url" python3 - <<'PYEOF'
 import json, os, sys, time, urllib.parse, urllib.request, urllib.error
 
@@ -129,6 +130,8 @@ def parse_json_param(raw):
 
 # ─── 解析回调链接（parse_qs + unquote 处理 URL 编码）───
 qs = urllib.parse.parse_qs(urllib.parse.urlparse(CALLBACK).query)
+model_host = str((qs.get("host") or [""])[0])
+auth_host = str((qs.get("authHost") or qs.get("auth_host") or [""])[0])
 refresh_token = (qs.get("refreshToken") or [""])[0]
 user_info = parse_json_param((qs.get("userInfo") or [""])[0]) or {}
 user_jwt = parse_json_param((qs.get("userJwt") or [""])[0]) or {}
@@ -136,6 +139,9 @@ user_jwt = parse_json_param((qs.get("userJwt") or [""])[0]) or {}
 uid = str(user_info.get("UserID") or "")
 nickname = str(user_info.get("ScreenName") or "")
 ent_id = str(user_info.get("TenantID") or "")
+# 企业（SaaS/SSO）登录时回调会点名租户的模型/续期 host（插件 traeHost 同口径）
+model_host = str(user_info.get("Host") or qs.get("host") or [""])[0]
+auth_host = str(user_info.get("AuthHost") or user_info.get("authHost") or qs.get("authHost") or qs.get("auth_host") or [""])[0]
 
 # 容错：回调缺 refreshToken 时，尝试 userJwt 里的 Token/RefreshToken
 jwt_token = str(user_jwt.get("Token") or "")
@@ -194,6 +200,7 @@ out = {
     "uid": uid, "nickname": nickname, "enterprise_id": ent_id,
     "access_token": token, "refresh_token": new_refresh, "expires_at": expires_at,
     "api_host": API_HOST, "machine_id": MACHINE_ID, "device_id": DEVICE_ID,
+    "model_host": MODEL_HOST, "auth_host": AUTH_HOST,
 }
 print("JSON:" + json.dumps(out))
 PYEOF
@@ -214,6 +221,8 @@ REFRESH=$(echo "$CRED" | python3 -c "import json,sys; print(json.load(sys.stdin)
 EXPIRES_AT=$(echo "$CRED" | python3 -c "import json,sys; print(json.load(sys.stdin)['expires_at'])")
 MACHINE_ID=$(echo "$CRED" | python3 -c "import json,sys; print(json.load(sys.stdin)['machine_id'])")
 DEVICE_ID=$(echo "$CRED" | python3 -c "import json,sys; print(json.load(sys.stdin)['device_id'])")
+MODEL_HOST=$(echo "$CRED" | python3 -c "import json,sys; print(json.load(sys.stdin).get('model_host',''))")
+AUTH_HOST=$(echo "$CRED" | python3 -c "import json,sys; print(json.load(sys.stdin).get('auth_host',''))")
 
 # ─── 落盘 auths/trae-{uid}.json（与 internal/auth 读取格式一致）───
 AUTH_FILE="$AUTH_DIR/trae-${ACCT_UID}.json"
@@ -224,7 +233,7 @@ else
     echo "新账号（uid=$ACCT_UID），新增 auth 文件"
     ACTION="新增"
 fi
-MACHINE_ID="$MACHINE_ID" DEVICE_ID="$DEVICE_ID" TOKEN="$TOKEN" REFRESH="$REFRESH" EXPIRES_AT="$EXPIRES_AT" ACCT_UID="$ACCT_UID" NICKNAME="$NICKNAME" AUTH_FILE="$AUTH_FILE" ACTION="$ACTION" python3 - <<'PYEOF'
+MACHINE_ID="$MACHINE_ID" DEVICE_ID="$DEVICE_ID" TOKEN="$TOKEN" REFRESH="$REFRESH" EXPIRES_AT="$EXPIRES_AT" ACCT_UID="$ACCT_UID" NICKNAME="$NICKNAME" AUTH_FILE="$AUTH_FILE" ACTION="$ACTION" MODEL_HOST="$MODEL_HOST" AUTH_HOST="$AUTH_HOST" python3 - <<'PYEOF'
 import json, os
 auth = {
     "account": {"uid": os.environ["ACCT_UID"], "enterpriseId": "", "nickname": os.environ["NICKNAME"]},
@@ -236,6 +245,8 @@ auth = {
         "apiHost": "https://api.trae.com.cn",
         "machineId": os.environ["MACHINE_ID"],
         "deviceId": os.environ["DEVICE_ID"],
+        "modelHost": os.environ.get("MODEL_HOST", ""),
+        "authHost": os.environ.get("AUTH_HOST", ""),
     },
 }
 with open(os.environ["AUTH_FILE"], "w") as f:

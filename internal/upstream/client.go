@@ -180,6 +180,28 @@ func New() *Client {
 }
 
 func (c *Client) agentBase() string { return c.AgentHost }
+
+// agentBaseFor 返回指定账号的 agent 网关：企业（SaaS）账号登录时会记下自己的
+// 模型 host（插件 traeHost 白名单同口径），聊天/模型列表走租户网关；个人账号
+// 为空回落默认 agent host。
+func (c *Client) agentBaseFor(a *auth.Auth) string {
+	if a != nil && a.ModelHost != "" {
+		return a.ModelHost
+	}
+	return c.AgentHost
+}
+
+// authBaseFor 返回指定账号的续期 host：企业账号记下的 authHost 优先，个人
+// 账号回落登录时使用的 apiHost/默认 OAuth host。
+func (c *Client) authBaseFor(a *auth.Auth) string {
+	if a != nil && a.AuthHost != "" {
+		return a.AuthHost
+	}
+	if a != nil && a.ApiHost != "" {
+		return a.ApiHost
+	}
+	return c.oauthBase()
+}
 func (c *Client) ugBase() string    { return c.UgHost }
 func (c *Client) oauthBase() string { return c.OAuthHost }
 
@@ -241,7 +263,10 @@ func (c *Client) refreshLocked(a *auth.Auth) error {
 	} else {
 		log.Printf("device-bound refresh failed uid=%s, falling back to exchange: %v", a.UID, derr)
 	}
-	host := a.ApiHost
+	host := a.AuthHost
+	if host == "" {
+		host = a.ApiHost
+	}
 	if host == "" {
 		host = c.oauthBase()
 	}
@@ -305,7 +330,7 @@ func normalizeExpiresAt(v int64) int64 {
 // body 为上游响应体（供调用方 Classify 与 wrongFunction 判定）、err 为 nil；
 // 只有传输层失败才返回 err。
 func (c *Client) ChatStream(a *auth.Auth, body []byte, opts ChatOpts, session, who string) (rc io.ReadCloser, status int, respBody []byte, err error) {
-	req, err := http.NewRequest(http.MethodPost, c.agentBase()+EpChat, bytes.NewReader(PrepareBodyOpts(body, opts, session, who)))
+	req, err := http.NewRequest(http.MethodPost, c.agentBaseFor(a)+EpChat, bytes.NewReader(PrepareBodyOpts(body, opts, session, who)))
 	if err != nil {
 		return nil, 0, nil, err
 	}
@@ -423,7 +448,7 @@ func (c *Client) batchLists(a *auth.Auth) (map[string][]rawEntry, error) {
 		"show_custom_model":         true,
 	}
 	raw, _ := json.Marshal(body)
-	req, err := http.NewRequest(http.MethodPost, c.agentBase()+EpBatchModels, bytes.NewReader(raw))
+	req, err := http.NewRequest(http.MethodPost, c.agentBaseFor(a)+EpBatchModels, bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
@@ -469,7 +494,7 @@ func (c *Client) listOf(a *auth.Auth, fn string) ([]rawEntry, error) {
 		"agent_type":          nil,
 	}
 	raw, _ := json.Marshal(body)
-	req, err := http.NewRequest(http.MethodPost, c.agentBase()+EpModels, bytes.NewReader(raw))
+	req, err := http.NewRequest(http.MethodPost, c.agentBaseFor(a)+EpModels, bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
@@ -691,7 +716,10 @@ func (c *Client) UserEntUsage(a *auth.Auth) (remain int64, err error) {
 
 // GetUserInfo 查询账号信息（登录用）。
 func (c *Client) GetUserInfo(a *auth.Auth) (uid, nickname, enterpriseID string, err error) {
-	host := a.ApiHost
+	host := a.AuthHost
+	if host == "" {
+		host = a.ApiHost
+	}
 	if host == "" {
 		host = c.oauthBase()
 	}

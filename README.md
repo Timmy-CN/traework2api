@@ -152,3 +152,16 @@ data/             （gitignored）state.json 池状态
 - `docs/` 不参与上传（gitignore + dockerignore）。
 - 验证类文档（`VERIFICATION.md` 等）不入库。
 - 日志/状态输出只显示 UID/Nickname/积分，不打印 token。
+
+## 企业版（SaaS/SSO）账号
+
+企业（SaaS/SSO）账号与企业个人账号的差异只在**网关 host**：企业租户的模型与
+续期走租户自己的网关（登录页会点名），个人账号走消费网关。
+
+- **login.sh**：解析回调里的 `userInfo.Host` / `authHost`，落盘为凭证的
+  `modelHost` / `authHost` 字段；未点名时为空（个人账号口径，行为不变）。
+- **聊天 / 模型列表**：`modelHost` 非空的账号走租户网关（`agentBaseFor`），
+  其余账号走默认 `trae-api-cn` host；多账号混合时按账号各自路由，互不影响。
+- **续期**：`authHost` 优先，回落 `apiHost`/默认 OAuth host。
+- 约束：host 必须是 https 且在 `trae.cn` / `trae.ai` / `mchost.guru` 上
+  （插件 `traeHost` 白名单同口径），带端口/凭据/查询串的会被拒绝。

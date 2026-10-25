@@ -27,6 +27,8 @@ type Auth struct {
 	ExpiresAt          int64  // Unix 秒（accessToken 过期时刻）
 	Domain             string // "trae.cn"
 	ApiHost            string // "https://api.trae.com.cn"（ExchangeToken host）
+	ModelHost          string // 企业租户的模型网关（个人账号为空 → 用默认 agent host）
+	AuthHost           string // 企业租户的续期 host（个人账号为空 → 用默认 OAuth host）
 	MachineID          string // 模型通道 x-machine-id
 	DeviceID           string // 模型通道 x-device-id
 	CheckinDeviceID    string // 签到 x-device-id
@@ -95,6 +97,8 @@ func parseNested(raw []byte) (*Auth, error) {
 			ExpiresAt          int64  `json:"expiresAt"`
 			Domain             string `json:"domain"`
 			ApiHost            string `json:"apiHost"`
+			ModelHost          string `json:"modelHost"`
+			AuthHost           string `json:"authHost"`
 			MachineID          string `json:"machineId"`
 			DeviceID           string `json:"deviceId"`
 			CheckinDeviceID    string `json:"checkinDeviceId"`
@@ -118,6 +122,8 @@ func parseNested(raw []byte) (*Auth, error) {
 		ExpiresAt:          n.Auth.ExpiresAt,
 		Domain:             n.Auth.Domain,
 		ApiHost:            n.Auth.ApiHost,
+		ModelHost:          n.Auth.ModelHost,
+		AuthHost:           n.Auth.AuthHost,
 		MachineID:          n.Auth.MachineID,
 		DeviceID:           n.Auth.DeviceID,
 		CheckinDeviceID:    n.Auth.CheckinDeviceID,
@@ -144,6 +150,8 @@ func parseFlat(raw []byte) (*Auth, error) {
 		CheckinDeviceID    string `json:"checkinDeviceId"`
 		CheckinDeviceBrand string `json:"checkinDeviceBrand"`
 		CheckinDeviceType  string `json:"checkinDeviceType"`
+		ModelHost          string `json:"modelHost"`
+		AuthHost           string `json:"authHost"`
 		UID                string `json:"uid"`
 		EnterpriseID       string `json:"enterpriseId"`
 		Nickname           string `json:"nickname"`
@@ -157,6 +165,8 @@ func parseFlat(raw []byte) (*Auth, error) {
 		ExpiresAt:          f.ExpiresAt,
 		Domain:             f.Domain,
 		ApiHost:            f.ApiHost,
+		ModelHost:          f.ModelHost,
+		AuthHost:           f.AuthHost,
 		MachineID:          f.MachineID,
 		DeviceID:           f.DeviceID,
 		CheckinDeviceID:    f.CheckinDeviceID,
@@ -218,6 +228,8 @@ func (a *Auth) saveAtomicLocked() error {
 			"expiresAt":          a.ExpiresAt,
 			"domain":             a.Domain,
 			"apiHost":            a.ApiHost,
+			"modelHost":          a.ModelHost,
+			"authHost":           a.AuthHost,
 			"machineId":          a.MachineID,
 			"deviceId":           a.DeviceID,
 			"checkinDeviceId":    a.CheckinDeviceID,
