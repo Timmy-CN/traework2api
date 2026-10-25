@@ -3,6 +3,7 @@ package auth
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -73,8 +74,11 @@ func TestSaveAtomicRoundtripPreservesSOLOFields(t *testing.T) {
 	if _, err := os.Stat(fp + ".tmp"); !os.IsNotExist(err) {
 		t.Error("tmp file should not remain")
 	}
-	if fi, err := os.Stat(fp); err != nil || fi.Mode().Perm() != 0o600 {
-		t.Errorf("file mode=%v err=%v want 0600", fi.Mode().Perm(), err)
+	// Windows 的 Stat 恒报 0666（无 POSIX 权限位），0600 断言仅在 POSIX 有意义。
+	if fi, err := os.Stat(fp); err != nil {
+		t.Errorf("stat: %v", err)
+	} else if runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
+		t.Errorf("file mode=%v want 0600", fi.Mode().Perm())
 	}
 	raw, err := os.ReadFile(fp)
 	if err != nil {

@@ -237,3 +237,34 @@ func TestCheckinIneligibleDayPersistsAndExpires(t *testing.T) {
 		t.Fatal("yesterday's mark must expire")
 	}
 }
+
+// TestReenableUnlimited 无限包账号：credits 权重取最大（Pick 恒优先，
+// 即使其他账号 SetCredits 更高），Unlimited 进状态，冷却照常解除，
+// 且落盘重载后保持。
+func TestReenableUnlimited(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "pool.state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "unl"})
+	p.Add(&auth.Auth{UID: "limited"})
+	p.SetCredits("limited", 9000)
+	p.Cooldown("unl", CoolPlan, time.Hour, "plan limit")
+	p.ReenableUnlimited("unl")
+
+	if got := p.Pick(); got == nil || got.UID != "unl" {
+		t.Fatalf("unlimited 账号应恒优先, pick=%+v", got)
+	}
+	st, ok := p.Status("unl")
+	if !ok || !st.Unlimited {
+		t.Fatalf("状态应带 Unlimited: %+v ok=%v", st, ok)
+	}
+
+	// 重载后 Unlimited 与 credits 权重保持。
+	p2 := New(fp)
+	if got := p2.Pick(); got == nil || got.UID != "unl" {
+		t.Fatalf("重载后 unlimited 仍应优先, pick=%+v", got)
+	}
+	if st, _ := p2.Status("unl"); !st.Unlimited {
+		t.Fatalf("重载后状态应仍带 Unlimited: %+v", st)
+	}
+}

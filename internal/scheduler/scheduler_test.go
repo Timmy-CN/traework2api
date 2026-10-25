@@ -162,9 +162,11 @@ func TestRunCheckinDoesNotLogSuccessWhenStatusDoesNotChange(t *testing.T) {
 	}
 }
 
-// 凭证缺 checkinDeviceId 且无法从本机官方客户端自动读取时，
-// 必须跳过签到并打印明确提示，不发无设备头的无效请求，也不生成随机假 ID。
-func TestRunCheckinSkipsMissingCheckinDeviceID(t *testing.T) {
+// 凭证缺 checkinDeviceId 且无法从本机官方客户端读取时：按插件 #194/#361
+// 口径，签到改用账号自身的派生设备 id（登录设备+uid 稳定派生的 16 位，
+// 不落盘、绝不取别的账号的设备），只有派生不出（登录设备与 uid 都为空）
+// 的账号才跳过并打印明确提示。
+func TestRunCheckinDerivedDeviceWithoutClientProfile(t *testing.T) {
 	t.Setenv("TW2A_DISABLE_CHECKIN_DETECT", "1") // 隔离本机官方客户端数据，保持用例 hermetic
 	f := &fakeUpstream{resourceRemain: 500}
 	srv := f.server()
@@ -172,6 +174,7 @@ func TestRunCheckinSkipsMissingCheckinDeviceID(t *testing.T) {
 
 	p := pool.New("")
 	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Add(&auth.Auth{AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}) // 无 UID：派生不出设备
 
 	var logs strings.Builder
 	old := log.Writer()
@@ -180,12 +183,14 @@ func TestRunCheckinSkipsMissingCheckinDeviceID(t *testing.T) {
 
 	s := newTestScheduler(f, p, srv)
 	s.RunCheckinNow()
-	if f.checkinCalls.Load() != 0 || f.claimCalls.Load() != 0 {
-		t.Errorf("no upstream checkin calls expected, status=%d claim=%d",
-			f.checkinCalls.Load(), f.claimCalls.Load())
+	if f.claimCalls.Load() != 1 {
+		t.Errorf("u1 应以派生设备签到一次, claims=%d", f.claimCalls.Load())
+	}
+	if !strings.Contains(logs.String(), "派生签到设备ID") {
+		t.Fatalf("missing derived-device hint: %s", logs.String())
 	}
 	if !strings.Contains(logs.String(), "缺签到设备ID") {
-		t.Fatalf("missing skip hint: %s", logs.String())
+		t.Fatalf("empty-uid account should still skip: %s", logs.String())
 	}
 }
 
@@ -281,5 +286,34 @@ func TestRunCheckinBusinessFailureNotOk(t *testing.T) {
 	}
 	if !strings.Contains(logs, "code=1005") {
 		t.Errorf("business failure should be logged with upstream code:\n%s", logs)
+	}
+}
+
+// TestRunCheckinUnlimitedEntUsage 无限包（credits_limit = -1）账号：
+// ent-usage 记 unlimited 并恒解冻（冷却解除、状态带 Unlimited），
+// 不再出现「无限账号被算成 remain=0」的旧口径。
+func TestRunCheckinUnlimitedEntUsage(t *testing.T) {
+	f := &fakeUpstream{resourceRemain: -1}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999, CheckinDeviceID: "cd-u1"})
+	p.Cooldown("u1", pool.CoolPlan, time.Hour, "plan limit")
+
+	var logs strings.Builder
+	old := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(old)
+
+	s := newTestScheduler(f, p, srv)
+	s.RunCheckinNow()
+
+	if !strings.Contains(logs.String(), "ent-usage u1: unlimited") {
+		t.Fatalf("missing unlimited log: %s", logs.String())
+	}
+	st, _ := p.Status("u1")
+	if !st.Unlimited || st.Cooling {
+		t.Fatalf("unlimited 账号应解冻且带 Unlimited: %+v", st)
 	}
 }

@@ -110,27 +110,27 @@ func NewTextTools(tools []ToolDef) *TextTools {
 }
 
 var (
-	reOpenAttr = regexp.MustCompile(`<tool_?call(\s[^<>{}]*)?>`)
-	reOpenJSON = regexp.MustCompile(`<tool_?call(\s*\{)`)
-	reOpenHold = regexp.MustCompile(`<tool_?call(?:\s[^<>{}\n]{0,200})?$`)
-	reStrayAt  = regexp.MustCompile(`[}\]"'>]*\s*</tool_?calls?>`)
+	reOpenAttr  = regexp.MustCompile(`<tool_?call(\s[^<>{}]*)?>`)
+	reOpenJSON  = regexp.MustCompile(`<tool_?call(\s*\{)`)
+	reOpenHold  = regexp.MustCompile(`<tool_?call(?:\s[^<>{}\n]{0,200})?$`)
+	reStrayAt   = regexp.MustCompile(`[}\]"'>]*\s*</tool_?calls?>`)
 	reStrayHold = regexp.MustCompile(`[}\]"'>][\s}\]"'>]*$`)
-	reTailJunk = regexp.MustCompile(`^[\s}\]"'>]*`)
-	reReasonAt = regexp.MustCompile(`\{\s*"reasoning_content"\s*:`)
+	reTailJunk  = regexp.MustCompile(`^[\s}\]"'>]*`)
+	reReasonAt  = regexp.MustCompile(`\{\s*"reasoning_content"\s*:`)
 
-	dsmlSrc       = `<\s*/?\s*[|｜][\s|｜]*DSML[\s|｜]*`
-	reDSMLAt      = regexp.MustCompile(dsmlSrc)
-	reDSMLTag     = regexp.MustCompile(`^` + dsmlSrc + `([^\s|｜<>][^<>]*)?>`)
-	reDSMLInvoke  = regexp.MustCompile(`^<\s*[|｜][\s|｜]*DSML[\s|｜]*invoke\s+name\s*=\s*"([^"]+)"\s*>`)
+	dsmlSrc        = `<\s*/?\s*[|｜][\s|｜]*DSML[\s|｜]*`
+	reDSMLAt       = regexp.MustCompile(dsmlSrc)
+	reDSMLTag      = regexp.MustCompile(`^` + dsmlSrc + `([^\s|｜<>][^<>]*)?>`)
+	reDSMLInvoke   = regexp.MustCompile(`^<\s*[|｜][\s|｜]*DSML[\s|｜]*invoke\s+name\s*=\s*"([^"]+)"\s*>`)
 	reDSMLInvokeAt = regexp.MustCompile(`<\s*[|｜][\s|｜]*DSML[\s|｜]*invoke\s+name\s*=`)
-	reDSMLClose   = regexp.MustCompile(`<\s*/\s*[|｜][\s|｜]*DSML[\s|｜]*invoke\s*>`)
-	reDSMLParam   = regexp.MustCompile(`<\s*[|｜][\s|｜]*DSML[\s|｜]*parameter\s+name\s*=\s*"([^"]+)"((?:\s+\w+\s*=\s*"[^"]*")*)\s*>([\s\S]*?)` + dsmlSrc + `parameter\s*>`)
+	reDSMLClose    = regexp.MustCompile(`<\s*/\s*[|｜][\s|｜]*DSML[\s|｜]*invoke\s*>`)
+	reDSMLParam    = regexp.MustCompile(`<\s*[|｜][\s|｜]*DSML[\s|｜]*parameter\s+name\s*=\s*"([^"]+)"((?:\s+\w+\s*=\s*"[^"]*")*)\s*>([\s\S]*?)` + dsmlSrc + `parameter\s*>`)
 
-	reXMLAt    = regexp.MustCompile(`<(?:antml:)?(?:function_calls>|invoke\s+name\s*=|function=)`)
-	reXMLHold  = regexp.MustCompile(`<(?:antml:)?(?:invoke\s[^<>]{0,300}|function=[^<>]{0,300})$`)
-	reXMLNext  = regexp.MustCompile(`<(?:antml:)?invoke\s+name\s*=|<function=`)
+	reXMLAt     = regexp.MustCompile(`<(?:antml:)?(?:function_calls>|invoke\s+name\s*=|function=)`)
+	reXMLHold   = regexp.MustCompile(`<(?:antml:)?(?:invoke\s[^<>]{0,300}|function=[^<>]{0,300})$`)
+	reXMLNext   = regexp.MustCompile(`<(?:antml:)?invoke\s+name\s*=|<function=`)
 	reXMLInvoke = regexp.MustCompile(`^<(?:antml:)?invoke\s+name\s*=\s*"([^"<>]+)"\s*>`)
-	reXMLFunc  = regexp.MustCompile(`^<function=([^\s<>]+?)\s*>`)
+	reXMLFunc   = regexp.MustCompile(`^<function=([^\s<>]+?)\s*>`)
 
 	reParamOpen = regexp.MustCompile(`<parameter(?:\s+name\s*=\s*"([^"]+)"|=([^\s>]+))\s*>`)
 	reParamHead = regexp.MustCompile(`^\s*\{\s*"name"\s*:\s*"([^"]+)"\s*\}?\s*>?\s*(<parameter\b)`)
@@ -469,7 +469,7 @@ func repairedJSON(s string) map[string]any {
 				return `\\t`
 			}
 		})
-		if u, ok := jsonStr(`"`+inner+`"`); ok {
+		if u, ok := jsonStr(`"` + inner + `"`); ok {
 			tries = append(tries, u, escapeRaw(u))
 		}
 		tries = append(tries, strings.ReplaceAll(s, `\"`, `"`))
@@ -967,7 +967,7 @@ func (t *TextTools) Push(s string, end bool) TTResult {
 		if s >= 0 && beforeAll(s, i, d, r, x) {
 			head := t.buf[:s]
 			tail := strings.ContainsAny(smStr[:1], `}]"'>`) ||
-				strings.TrimSpace((t.sent+text.String()+head)[min(t.mark, len(t.sent)+text.Len()):]) == ""
+				strings.TrimSpace((t.sent + text.String() + head)[min(t.mark, len(t.sent)+text.Len()):]) == ""
 			if !tail || ttQuoted(t.sent+text.String()+head) {
 				text.WriteString(t.buf[:s+len(smStr)])
 				t.buf = t.buf[s+len(smStr):]

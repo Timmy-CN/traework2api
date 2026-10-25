@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -26,6 +27,11 @@ var (
 	ErrAlreadyCheckedIn = errors.New("already checked in")
 	// ErrCheckinDisabled 该账号签到活动未开启。
 	ErrCheckinDisabled = errors.New("checkin disabled")
+	// ErrCheckinUnverified claim 已发出，但读回未能确认签到成立（复核
+	// checked_in=false、读回失败或状态滞后）。按插件 0.2.22 口径：claim 一经
+	// 发出，读回说什么就是当天的答案，绝不重复领取；调用方应记为当天不可
+	// 再领取（ineligible），次日恢复。
+	ErrCheckinUnverified = errors.New("checkin unverified: nothing is claimed again today")
 )
 
 // CheckinError 签到接口的业务错误（HTTP 200 但 code != 0 或 success == false）。
@@ -111,21 +117,44 @@ func (e *Error) Error() string {
 
 var sessionDeadMarkers = []string{"login", "token 失效", "token invalid", "session", "unauthorized", "401"}
 
-// Classify 按 HTTP 状态码 + body 判定错误类别（SPEC §4.3）。
+// lapsedWords / quotaWords 文案正则（插件 lapsedWords/quotaWords 口径）。
+// lapsed：token 被拒；quota：额度类。403 + 文案是 CN 与全球站都会用的形态。
+var (
+	lapsedWords = regexp.MustCompile(`(?i)not ?log(ged)? ?in|unauthori[sz]ed|token (is )?(expired|invalid)|jwt|未登录|登录(已)?(过期|失效)`)
+	quotaWords  = regexp.MustCompile(`(?i)quota|credit|insufficient|exceed|limit|额度|积分|次数|上限|用完`)
+)
+
+// quotaCode 插件 quotaCode 口径：4008/4011 业务码（1005 另归 plan 硬冷却）。
+func quotaCode(code int64) bool { return code == 4008 || code == 4011 }
+
+// quotaCodeInBody body 里是否带额度类业务码。
+func quotaCodeInBody(body string) bool {
+	return strings.Contains(body, `"code":4008`) || strings.Contains(body, `"code":4011`)
+}
+
+// Classify 按 HTTP 状态码 + body 判定错误类别（SPEC §4.3；错误码集对齐插件
+// lapsedCode/quotaCode——CN [1001,401]+[4008,1005]，全球站 lapsed 加 20101、
+// quota 加 4011）。
 func Classify(status int, body string) ErrKind {
 	lower := strings.ToLower(body)
 	// 1005 plan 权益不足
 	if strings.Contains(body, `"code":1005`) || (strings.Contains(body, "1005") && strings.Contains(lower, "plan")) {
 		return ErrPlanLimit
 	}
-	// session 失效
-	if status == http.StatusUnauthorized {
+	// session 失效：401，或 20101 业务码（全球站 lapsed 名单），或 403 + 登录态文案
+	if status == http.StatusUnauthorized ||
+		strings.Contains(body, `"code":20101`) ||
+		(status == http.StatusForbidden && lapsedWords.MatchString(lower)) {
 		for _, m := range sessionDeadMarkers {
 			if strings.Contains(lower, strings.ToLower(m)) {
 				return ErrSessionDead
 			}
 		}
 		return ErrSessionDead
+	}
+	// 额度类：4008/4011 业务码，或 403 + 额度文案 → 插件口径按 429 软冷却
+	if quotaCodeInBody(body) || (status == http.StatusForbidden && quotaWords.MatchString(lower)) {
+		return ErrSoftRate
 	}
 	if status == http.StatusTooManyRequests {
 		return ErrSoftRate
@@ -182,17 +211,35 @@ func New() *Client {
 func (c *Client) agentBase() string { return c.AgentHost }
 
 // agentBaseFor 返回指定账号的 agent 网关：企业（SaaS）账号登录时会记下自己的
-// 模型 host（插件 traeHost 白名单同口径），聊天/模型列表走租户网关；个人账号
-// 为空回落默认 agent host。
+// 模型 host（插件 traeHost 白名单同口径），聊天/模型列表走租户网关；全球站
+// 账号按 region 分 SG/US 网关；个人 CN 账号回落默认 agent host。
 func (c *Client) agentBaseFor(a *auth.Auth) string {
 	if a != nil && a.ModelHost != "" {
 		return a.ModelHost
 	}
-	return c.AgentHost
+	site := c.siteFor(a)
+	if site.USAPIHost != "" && c.accountIsUS(a) {
+		return site.USAPIHost
+	}
+	return site.APIHost
+}
+
+// accountIsUS 全球站账号是否 US 区：region 以 US 开头，或登录 host 指向
+// US 网关（coreva / api-us）（插件 apiOf 口径）。
+func (c *Client) accountIsUS(a *auth.Auth) bool {
+	if a == nil {
+		return false
+	}
+	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(a.Region)), "US") {
+		return true
+	}
+	h := strings.ToLower(a.ApiHost)
+	return strings.Contains(h, "coreva") || strings.Contains(h, "api-us")
 }
 
 // authBaseFor 返回指定账号的续期 host：企业账号记下的 authHost 优先，个人
-// 账号回落登录时使用的 apiHost/默认 OAuth host。
+// 账号回落登录时使用的 apiHost/所属站点默认（CN api.trae.com.cn，Global
+// growsg-normal.trae.ai）。
 func (c *Client) authBaseFor(a *auth.Auth) string {
 	if a != nil && a.AuthHost != "" {
 		return a.AuthHost
@@ -200,10 +247,32 @@ func (c *Client) authBaseFor(a *auth.Auth) string {
 	if a != nil && a.ApiHost != "" {
 		return a.ApiHost
 	}
-	return c.oauthBase()
+	return c.siteFor(a).AuthHost
 }
 func (c *Client) ugBase() string    { return c.UgHost }
 func (c *Client) oauthBase() string { return c.OAuthHost }
+
+// ugBaseFor 返回账号的 ug/用量 host：CN 用默认 ug host（api.trae.cn）；
+// 全球站账号按 region 用 US/中央 pay host（插件 usage.host 口径——auth host
+// 自己的 /cloudide/api/v2/pay 页面 403 Api Scope Forbidden）。
+func (c *Client) ugBaseFor(a *auth.Auth) string {
+	site := c.siteFor(a)
+	if site.PayHost == "" {
+		return c.ugBase()
+	}
+	if c.accountIsUS(a) {
+		return site.USPayHost
+	}
+	return site.PayHost
+}
+
+// siteFor 账号所属站点：CN 为空 region/apiHost 时的默认。
+func (c *Client) siteFor(a *auth.Auth) *Site {
+	if a == nil {
+		return Sites["trae-cn"]
+	}
+	return SiteOf(a.Region, a.ApiHost)
+}
 
 // doJSON 发请求并解 JSON；HTTP 非 2xx 时返回带 body 片段的 *Error。
 func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
@@ -249,29 +318,26 @@ func (c *Client) refreshLocked(a *auth.Auth) error {
 	if strings.TrimSpace(a.RefreshToken) == "" {
 		return fmt.Errorf("no refreshToken")
 	}
-	// 先设备绑定刷新（插件 boundExchange 口径）：不消耗 refresh_token、不踢
-	// 该账号的其他客户端；设备密钥缺失时懒生成并随本次写回持久化。全部失败
-	// 回退到下面的通用轮换通道（会轮换并作废旧 refresh_token）。
-	if access, refresh, expires, derr := c.deviceBoundExchange(context.Background(), a); derr == nil {
-		a.AccessToken = access
-		a.RefreshToken = refresh
-		if expires > 0 {
-			a.ExpiresAt = expires
+	// 先设备绑定刷新（插件 boundExchange 口径，仅 CN——全球站无
+	// deviceExchange，直接普通轮换）：不消耗 refresh_token、不踢该账号的
+	// 其他客户端；设备密钥缺失时懒生成并随本次写回持久化。全部失败回退到
+	// 下面的通用轮换通道（会轮换并作废旧 refresh_token）。
+	if len(c.siteFor(a).DeviceExchange) > 0 {
+		if access, refresh, expires, derr := c.deviceBoundExchange(context.Background(), a); derr == nil {
+			a.AccessToken = access
+			a.RefreshToken = refresh
+			if expires > 0 {
+				a.ExpiresAt = expires
+			}
+			log.Printf("device-bound refresh ok uid=%s", a.UID)
+			return nil
+		} else {
+			log.Printf("device-bound refresh failed uid=%s, falling back to exchange: %v", a.UID, derr)
 		}
-		log.Printf("device-bound refresh ok uid=%s", a.UID)
-		return nil
-	} else {
-		log.Printf("device-bound refresh failed uid=%s, falling back to exchange: %v", a.UID, derr)
 	}
-	host := a.AuthHost
-	if host == "" {
-		host = a.ApiHost
-	}
-	if host == "" {
-		host = c.oauthBase()
-	}
+	host := c.authBaseFor(a)
 	body := map[string]any{
-		"ClientID":     c.ClientID,
+		"ClientID":     c.siteFor(a).ClientID,
 		"RefreshToken": a.RefreshToken, // 已持 a 写锁，直接读
 		"ClientSecret": "-",
 		"UserID":       "",
@@ -288,11 +354,11 @@ func (c *Client) refreshLocked(a *auth.Auth) error {
 	}
 	var resp struct {
 		Result struct {
-			Token                string `json:"Token"`
-			TokenExpireAt        int64  `json:"TokenExpireAt"`
-			TokenExpireDuration  int64  `json:"TokenExpireDuration"`
-			RefreshToken         string `json:"RefreshToken"`
-			RefreshExpireAt      int64  `json:"RefreshExpireAt"`
+			Token               string `json:"Token"`
+			TokenExpireAt       int64  `json:"TokenExpireAt"`
+			TokenExpireDuration int64  `json:"TokenExpireDuration"`
+			RefreshToken        string `json:"RefreshToken"`
+			RefreshExpireAt     int64  `json:"RefreshExpireAt"`
 		} `json:"Result"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
@@ -373,6 +439,11 @@ type ModelInfo struct {
 	// IsCustomModel 自定义模型（第三方代理，需额外授权）；
 	// 部分模型上游不返回该字段，调用方可用 custom_model_ 前缀兜底。
 	IsCustomModel bool
+	// Levels 模型承载的 reasoning 等级（low/high/xhigh 口径；空=条目没说）。
+	// Sees 模型是否收图（multimodal）；nil=目录没说。两者随目录缓存流转，
+	// 供 CatalogFrom 重建（否则 server 侧 effort/sees 恒缺）。
+	Levels []string
+	Sees   *bool
 }
 
 // batchResp / detailResp 两个模型端点的响应（data 包裹可选）。
@@ -385,7 +456,7 @@ type (
 		Data *batchResp `json:"data"`
 	}
 	detailResp struct {
-		ConfigInfoList []rawEntry `json:"config_info_list"`
+		ConfigInfoList []rawEntry  `json:"config_info_list"`
 		Data           *detailResp `json:"data"`
 	}
 )
@@ -438,12 +509,12 @@ func (c *Client) fetchCatalog(a *auth.Auth) (*catalog, error) {
 // Trae 回了无列表（HTTP 200 但 function_configs 缺失）→ nil, nil。
 func (c *Client) batchLists(a *auth.Auth) (map[string][]rawEntry, error) {
 	body := map[string]any{
-		"functions":       chatFunctions,
-		"agent_type":      "",
-		"current_config_info": map[string]any{"config_name": "", "is_custom_model": false},
-		"mode_type":           0,
-		"access_type":         0,
-		"ab_force_vids":       "",
+		"functions":                 chatFunctions,
+		"agent_type":                "",
+		"current_config_info":       map[string]any{"config_name": "", "is_custom_model": false},
+		"mode_type":                 0,
+		"access_type":               0,
+		"ab_force_vids":             "",
 		"ab_autotest_advanced_mode": 0,
 		"show_custom_model":         true,
 	}
@@ -572,8 +643,12 @@ func (r checkinResp) businessErr() error {
 
 // CheckinStatus 查询签到状态。业务码非零或 success=false 时返回错误。
 func (c *Client) CheckinStatus(a *auth.Auth) (checkedIn bool, credits int64, enable bool, err error) {
+	// 全球站无签到页（插件 SITES["trae-global"] 无 checkin）：按活动未开启口径。
+	if !c.siteFor(a).Checkin {
+		return false, 0, false, ErrCheckinDisabled
+	}
 	// 官方客户端签到请求体为 {"req_source":1}（抓包确认），非 {}。
-	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinStatus, bytes.NewReader([]byte(`{"req_source":1}`)))
+	req, err := http.NewRequest(http.MethodPost, c.ugBaseFor(a)+EpCheckinStatus, bytes.NewReader([]byte(`{"req_source":1}`)))
 	if err != nil {
 		return false, 0, false, err
 	}
@@ -608,8 +683,11 @@ func (c *Client) CheckinStatus(a *auth.Auth) (checkedIn bool, credits int64, ena
 // 等 CheckinRetryDelay 后重试一次。返回 nil 只表示「上游接受了本次请求」，
 // 是否真正签到成功由 DailyCheckin 的二次 status 复核裁决。
 func (c *Client) CheckinClaim(a *auth.Auth) error {
+	if !c.siteFor(a).Checkin {
+		return ErrCheckinDisabled
+	}
 	for attempt := 0; ; attempt++ {
-		req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinClaim, bytes.NewReader([]byte(`{"req_source":1}`)))
+		req, err := http.NewRequest(http.MethodPost, c.ugBaseFor(a)+EpCheckinClaim, bytes.NewReader([]byte(`{"req_source":1}`)))
 		if err != nil {
 			return err
 		}
@@ -644,6 +722,10 @@ func (c *Client) CheckinClaim(a *auth.Auth) error {
 // 以二次 status 的 checked_in 为最终结论，避免「claim 返回 200 但实际没签上」。
 // 已签到时返回 ErrAlreadyCheckedIn，未开启活动返回 ErrCheckinDisabled。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
+	// 全球站无签到页（插件 SITES["trae-global"] 无 checkin）。
+	if !c.siteFor(a).Checkin {
+		return ErrCheckinDisabled
+	}
 	checkedIn, _, enable, err := c.CheckinStatus(a)
 	if err != nil {
 		return err
@@ -657,26 +739,70 @@ func (c *Client) DailyCheckin(a *auth.Auth) error {
 	if err := c.CheckinClaim(a); err != nil {
 		return err
 	}
+	// claim 已发出：读回说什么就是当天的答案（插件 0.2.22 口径）——复核
+	// 未签上或读回失败都不是失败重试的理由（状态滞后读作未签一次会导致
+	// 二次 claim），而是当天不可再领取。
 	verified, _, _, err := c.CheckinStatus(a)
 	if err != nil {
-		return fmt.Errorf("checkin verification: %w", err)
+		return fmt.Errorf("checkin verification: %w: %w", ErrCheckinUnverified, err)
 	}
 	if !verified {
-		err := fmt.Errorf("checkin verification failed: checked_in=false after claim")
-		log.Printf("checkin verify uid=%s: %v", a.UID, err)
-		return err
+		return fmt.Errorf("checkin verification: %w: checked_in=false after claim", ErrCheckinUnverified)
 	}
-	log.Printf("checkin verified uid=%s", a.UID)
 	return nil
 }
 
-// UserEntUsage 聚合剩余积分（ide_user_ent_usage）。
-// 上游每个包的 quota.credits_limit 为总额度，usage.credits_amount 为已消耗，
-// 剩余 = Σ(credits_limit) − Σ(usage.credits_amount)。
-// 旧实现只求和 credits_limit，导致把总额度当剩余且永不变动，故修正。
-func (c *Client) UserEntUsage(a *auth.Auth) (remain int64, err error) {
-	// 插件 usage 口径：body 带 require_usage/req_source（不是空 {}）。
-	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpEntUsage, bytes.NewReader([]byte(`{"require_usage":true,"req_source":0}`)))
+// DollarUsage 全球站美元计费读数（插件 dollarUsageOf 口径）。
+type DollarUsage struct {
+	Plan      string  // 套餐名（display_desc；空 → Free）
+	Basic     float64 // 基础额度（basic_usage_limit）
+	Bonus     float64 // 赠送额度（bonus_usage_limit）
+	Used      float64 // 基础已用（basic_usage_amount）
+	UsedBonus float64 // 赠送已用（bonus_usage_amount）
+	EndMs     int64   // 周期到期（毫秒；0 = 没说）
+}
+
+// Total / UsedTotal 周期总额度与已用。
+func (d DollarUsage) Total() float64 { return d.Basic + d.Bonus }
+func (d DollarUsage) UsedTotal() float64 {
+	return d.Used + d.UsedBonus
+}
+
+// dollarEntUsage 拉全球站的美元计费 entitlements 并折算成积分口径
+// （remain/unlimited）：总额度 > 0 时 remain = (total − used) × 100。
+func (c *Client) dollarEntUsage(a *auth.Auth) (int64, bool, error) {
+	req, err := http.NewRequest(http.MethodPost, c.ugBaseFor(a)+EpDollarUsage, bytes.NewReader([]byte(`{}`)))
+	if err != nil {
+		return 0, false, err
+	}
+	UgHeaders(req, a)
+	data, err := c.doJSON(req)
+	if err != nil {
+		return 0, false, err
+	}
+	d, err := parseDollarUsage(data)
+	if err != nil {
+		return 0, false, err
+	}
+	total, used := d.Total(), d.UsedTotal()
+	if total <= 0 {
+		// 有包但没写额度：按无限口径（不钳解冻）。
+		return 0, true, nil
+	}
+	remain := int64((total - used) * 100)
+	if remain < 0 {
+		remain = 0
+	}
+	return remain, false, nil
+}
+
+// SiteMeta 暴露账号站点（scheduler 判美元/积分口径）。
+func (c *Client) SiteMeta(a *auth.Auth) *Site { return c.siteFor(a) }
+
+// CreditsUntil 账号积分包的最近到期毫秒（插件 credits().until 口径：
+// 逐包取 end_time/expire_time 首个正值的最小值；没有 → 0）。
+func (c *Client) CreditsUntil(a *auth.Auth) (int64, error) {
+	req, err := http.NewRequest(http.MethodPost, c.ugBaseFor(a)+EpEntUsage, bytes.NewReader([]byte(`{"require_usage":true,"req_source":0}`)))
 	if err != nil {
 		return 0, err
 	}
@@ -684,6 +810,135 @@ func (c *Client) UserEntUsage(a *auth.Auth) (remain int64, err error) {
 	data, err := c.doJSON(req)
 	if err != nil {
 		return 0, err
+	}
+	var resp struct {
+		UserEntitlementPackList []struct {
+			EntitlementBaseInfo struct {
+				EndTime    any `json:"end_time"`
+				ExpireTime any `json:"expire_time"`
+			} `json:"entitlement_base_info"`
+		} `json:"user_entitlement_pack_list"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return 0, fmt.Errorf("ent usage parse: %w", err)
+	}
+	soonest := int64(0)
+	for _, p := range resp.UserEntitlementPackList {
+		for _, v := range []any{p.EntitlementBaseInfo.EndTime, p.EntitlementBaseInfo.ExpireTime} {
+			if ms := whenOfAny(v); ms > 0 && (soonest == 0 || ms < soonest) {
+				soonest = ms
+			}
+		}
+	}
+	return soonest, nil
+}
+
+// DollarEntUsage 对外读数（面板/credit 工具用）：全球站的美元计费明细。
+func (c *Client) DollarEntUsage(a *auth.Auth) (*DollarUsage, error) {
+	req, err := http.NewRequest(http.MethodPost, c.ugBaseFor(a)+EpDollarUsage, bytes.NewReader([]byte(`{}`)))
+	if err != nil {
+		return nil, err
+	}
+	UgHeaders(req, a)
+	data, err := c.doJSON(req)
+	if err != nil {
+		return nil, err
+	}
+	return parseDollarUsage(data)
+}
+
+// parseDollarUsage 解析 user_current_entitlement_list（插件 dollarUsageOf：
+// 取首个带 quota 的包）。
+func parseDollarUsage(data []byte) (*DollarUsage, error) {
+	var env struct {
+		List []struct {
+			DisplayDesc         string `json:"display_desc"`
+			EntitlementBaseInfo struct {
+				EndTime any `json:"end_time"`
+				Quota   struct {
+					BasicUsageLimit float64 `json:"basic_usage_limit"`
+					BonusUsageLimit float64 `json:"bonus_usage_limit"`
+				} `json:"quota"`
+			} `json:"entitlement_base_info"`
+			Usage struct {
+				BasicUsageAmount float64 `json:"basic_usage_amount"`
+				BonusUsageAmount float64 `json:"bonus_usage_amount"`
+			} `json:"usage"`
+		} `json:"user_entitlement_pack_list"`
+	}
+	if err := json.Unmarshal(data, &env); err != nil {
+		return nil, fmt.Errorf("dollar usage parse: %w", err)
+	}
+	for i := range env.List {
+		p := env.List[i]
+		q := p.EntitlementBaseInfo.Quota
+		if q.BasicUsageLimit == 0 && q.BonusUsageLimit == 0 {
+			continue
+		}
+		return &DollarUsage{
+			Plan:      strings.TrimSpace(p.DisplayDesc),
+			Basic:     q.BasicUsageLimit,
+			Bonus:     q.BonusUsageLimit,
+			Used:      p.Usage.BasicUsageAmount,
+			UsedBonus: p.Usage.BonusUsageAmount,
+			EndMs:     whenOfAny(p.EntitlementBaseInfo.EndTime),
+		}, nil
+	}
+	return nil, fmt.Errorf("dollar usage: no entitlement pack in the answer")
+}
+
+// whenOfAny 时间字段归一（插件 whenOf 口径）：数字秒→毫秒、字符串 ISO8601
+// 解析；无效 → 0。
+func whenOfAny(v any) int64 {
+	switch t := v.(type) {
+	case float64:
+		if t <= 0 {
+			return 0
+		}
+		if t < 1e11 {
+			return int64(t * 1000)
+		}
+		return int64(t)
+	case string:
+		if t == "" {
+			return 0
+		}
+		if parsed, err := time.Parse(time.RFC3339, t); err == nil {
+			return parsed.UnixMilli()
+		}
+		var n float64
+		if _, err := fmt.Sscanf(strings.TrimSpace(t), "%f", &n); err == nil && n > 0 {
+			if n < 1e11 {
+				return int64(n * 1000)
+			}
+			return int64(n)
+		}
+	}
+	return 0
+}
+
+// UserEntUsage 聚合剩余积分（ide_user_ent_usage）。
+// 上游每个包的 quota.credits_limit 为总额度，usage.credits_amount 为已消耗，
+// 剩余 = Σ(credits_limit) − Σ(usage.credits_amount)。
+// 旧实现只求和 credits_limit，导致把总额度当剩余且永不变动，故修正。
+// credits_limit 为 -1 的包是无限包（插件 credits 口径）：不计入 limit，
+// HasUnlimited 置位；无限账号的 remain 恒 0（无有限包可扣），调用方按
+// 无限口径展示/解冻。
+func (c *Client) UserEntUsage(a *auth.Auth) (remain int64, unlimited bool, err error) {
+	// 全球站走美元计费端点（插件 usage.kind=dollar），折算成积分口径供
+	// 统一解冻逻辑（1 美元 = 100）。
+	if c.siteFor(a).DollarUsage {
+		return c.dollarEntUsage(a)
+	}
+	// 插件 usage 口径：body 带 require_usage/req_source（不是空 {}）。
+	req, err := http.NewRequest(http.MethodPost, c.ugBaseFor(a)+EpEntUsage, bytes.NewReader([]byte(`{"require_usage":true,"req_source":0}`)))
+	if err != nil {
+		return 0, false, err
+	}
+	UgHeaders(req, a)
+	data, err := c.doJSON(req)
+	if err != nil {
+		return 0, false, err
 	}
 	var resp struct {
 		IsCreditsBilling        bool `json:"is_credits_billing"`
@@ -699,11 +954,17 @@ func (c *Client) UserEntUsage(a *auth.Auth) (remain int64, err error) {
 		} `json:"user_entitlement_pack_list"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, fmt.Errorf("ent usage parse: %w", err)
+		return 0, false, fmt.Errorf("ent usage parse: %w", err)
 	}
 	var limit, used float64
 	for _, p := range resp.UserEntitlementPackList {
-		limit += float64(p.EntitlementBaseInfo.Quota.CreditsLimit)
+		l := p.EntitlementBaseInfo.Quota.CreditsLimit
+		switch {
+		case l == -1:
+			unlimited = true // 无限包：不进 Σlimit
+		case l >= 0:
+			limit += float64(l)
+		}
 		used += p.Usage.CreditsAmount
 	}
 	// 剩余不能为负；API 仅提供总额度与已用量，无独立剩余字段。
@@ -711,11 +972,12 @@ func (c *Client) UserEntUsage(a *auth.Auth) (remain int64, err error) {
 	if remain < 0 {
 		remain = 0
 	}
-	return remain, nil
+	return remain, unlimited, nil
 }
 
-// GetUserInfo 查询账号信息（登录用）。
-func (c *Client) GetUserInfo(a *auth.Auth) (uid, nickname, enterpriseID string, err error) {
+// GetUserInfo 查询账号信息（登录用）。region 从 region/aiRegion/Region/
+// AIRegion 取（插件 site.regionOf 口径；全球站账号判区用）。
+func (c *Client) GetUserInfo(a *auth.Auth) (uid, nickname, enterpriseID, region string, err error) {
 	host := a.AuthHost
 	if host == "" {
 		host = a.ApiHost
@@ -727,13 +989,13 @@ func (c *Client) GetUserInfo(a *auth.Auth) (uid, nickname, enterpriseID string, 
 	raw, _ := json.Marshal(body)
 	req, err := http.NewRequest(http.MethodPost, host+EpUserInfo, bytes.NewReader(raw))
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 	OAuthHeaders(req)
 	req.Header.Set("X-Cloudide-Token", a.JWT()) // 读锁快照
 	data, err := c.doJSON(req)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 	var resp struct {
 		Result struct {
@@ -742,10 +1004,26 @@ func (c *Client) GetUserInfo(a *auth.Auth) (uid, nickname, enterpriseID string, 
 			EnterpriseID string `json:"EnterpriseID"`
 		} `json:"Result"`
 	}
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return "", "", "", fmt.Errorf("userinfo parse: %w", err)
+	// region 字段名跨部署不一（region/aiRegion/Region/AIRegion），整体解一层。
+	var full struct {
+		Result map[string]any `json:"Result"`
 	}
-	return resp.Result.UserID, resp.Result.ScreenName, resp.Result.EnterpriseID, nil
+	_ = json.Unmarshal(data, &full)
+	region = regionOfInfo(full.Result)
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return "", "", "", "", fmt.Errorf("userinfo parse: %w", err)
+	}
+	return resp.Result.UserID, resp.Result.ScreenName, resp.Result.EnterpriseID, region, nil
+}
+
+// regionOfInfo 从账号信息里取 region（插件 site.regionOf 口径）。
+func regionOfInfo(info map[string]any) string {
+	for _, k := range []string{"region", "aiRegion", "Region", "AIRegion"} {
+		if v, ok := info[k].(string); ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 func truncate(s string, n int) string {

@@ -35,9 +35,9 @@ var LEVELS = map[string]string{"light": "low", "high": "high", "extra_high": "xh
 
 // devModelRe / maxModelRe 细目名匹配（插件 /__dev$/、/__max$/）。
 var (
-	devModelRe  = regexp.MustCompile(devSuffix + `$`)
-	maxModelRe  = regexp.MustCompile(maxSuffix + `$`)
-	customRe    = regexp.MustCompile(`(?i)^custom_model`)
+	devModelRe = regexp.MustCompile(devSuffix + `$`)
+	maxModelRe = regexp.MustCompile(maxSuffix + `$`)
+	customRe   = regexp.MustCompile(`(?i)^custom_model`)
 )
 
 // detailList 是条目的 model_detail_list 细目（__dev/__max）。
@@ -82,7 +82,7 @@ type rawEntry struct {
 	// DisplayConfig 结构自由：display_name/multimodal/is_custom_model。
 	DisplayConfig displayMap `json:"display_config"`
 	// Display* 展示名备选。
-	DisplayName     string `json:"display_name"`
+	DisplayName      string `json:"display_name"`
 	DisplayModelName string `json:"display_model_name"`
 	// ModelDetailList __dev/__max 细目。
 	ModelDetailList detailList `json:"model_detail_list"`
@@ -369,7 +369,7 @@ func CatalogFrom(infos []ModelInfo) Catalog {
 	for i := range infos {
 		mi := infos[i]
 		base, isMax := takeMax(mi.ID)
-		e := &catalogEntry{Model: mi}
+		e := &catalogEntry{Model: mi, levels: mi.Levels, sees: mi.Sees}
 		if fn := mi.Function; fn != "" {
 			e.fn = fn
 		} else {
@@ -394,6 +394,12 @@ func ChatFunctions() []string { return chatFunctions }
 // FunctionOf 模型由哪个 function 列出（导出）。目录没有 → 空。
 func (c *catalog) FunctionOf(id string) string { return c.fnOf(id) }
 
+// Has 目录是否收录该 id（导出；server 判断 REREAD_MS 重读）。
+func (c *catalog) Has(id string) bool {
+	_, ok := c.entries[id]
+	return ok
+}
+
 // SeesOf 模型是否收图（导出）。目录没说 → nil。
 func (c *catalog) SeesOf(id string) *bool { return c.seesOf(id) }
 
@@ -404,7 +410,10 @@ func (c *catalog) LevelsOf(id string) []string { return c.levelsOf(id) }
 func (c *catalog) infos() []ModelInfo {
 	out := make([]ModelInfo, 0, len(c.order))
 	for _, id := range c.order {
-		out = append(out, c.entries[id].Model)
+		mi := c.entries[id].Model
+		mi.Levels = c.entries[id].levels
+		mi.Sees = c.entries[id].sees
+		out = append(out, mi)
 	}
 	return out
 }
@@ -447,6 +456,10 @@ func (c *catalog) reassign(id, fn string) {
 		e.fn = fn
 	}
 }
+
+// SplitMaxID 剥客户端模型 id 的 -max 后缀：返回 base id 与是否 Max 请求
+// （server 聊天入口用；Max 语义见 handler）。
+func SplitMaxID(id string) (string, bool) { return takeMax(id) }
 
 // takeMax 剥 <id>-max：返回 base id 与是否 Max 请求。
 func takeMax(id string) (string, bool) {

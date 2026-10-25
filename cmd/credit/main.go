@@ -38,19 +38,22 @@ type authFile struct {
 }
 
 type accountResult struct {
-	UID      string `json:"uid"`
-	Nickname string `json:"nickname"`
-	Remain   *int64 `json:"remain"`
-	Limit    *int64 `json:"limit,omitempty"`
-	Packages int    `json:"packages,omitempty"`
-	OK       bool   `json:"ok"`
-	Error    string `json:"error,omitempty"`
+	UID       string `json:"uid"`
+	Nickname  string `json:"nickname"`
+	Remain    *int64 `json:"remain"`
+	Unlimited bool   `json:"unlimited,omitempty"`
+	Limit     *int64 `json:"limit,omitempty"`
+	Packages  int    `json:"packages,omitempty"`
+	OK        bool   `json:"ok"`
+	Error     string `json:"error,omitempty"`
 }
 
-func fetchEntUsage(af *authFile) (remain int64, limit int64, packs int, err error) {
-	req, err := http.NewRequest(http.MethodPost, upstream.UgHost+upstream.EpEntUsage, bytes.NewReader([]byte("{}")))
+func fetchEntUsage(af *authFile) (remain int64, limit int64, packs int, unlimited bool, err error) {
+	// 插件 usage 口径：body 带 require_usage/req_source（不是空 {}）。
+	req, err := http.NewRequest(http.MethodPost, upstream.UgHost+upstream.EpEntUsage,
+		bytes.NewReader([]byte(`{"require_usage":true,"req_source":0}`)))
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, false, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -62,14 +65,14 @@ func fetchEntUsage(af *authFile) (remain int64, limit int64, packs int, err erro
 	client := &http.Client{Timeout: 20 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, false, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		return 0, 0, 0, fmt.Errorf("http %d", resp.StatusCode)
+		return 0, 0, 0, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
 	var env struct {
-		IsCreditsBilling bool `json:"is_credits_billing"`
+		IsCreditsBilling        bool `json:"is_credits_billing"`
 		UserEntitlementPackList []struct {
 			EntitlementBaseInfo struct {
 				Quota struct {
@@ -83,10 +86,16 @@ func fetchEntUsage(af *authFile) (remain int64, limit int64, packs int, err erro
 		} `json:"user_entitlement_pack_list"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, false, err
 	}
+	// credits_limit = -1 的包是无限包（插件 credits 口径）：不计入 Σlimit，
+	// 置 unlimited；有限包正常求和。
 	for _, p := range env.UserEntitlementPackList {
 		l := p.EntitlementBaseInfo.Quota.CreditsLimit
+		if l == -1 {
+			unlimited = true
+			continue
+		}
 		if l <= 0 {
 			continue
 		}
@@ -94,7 +103,7 @@ func fetchEntUsage(af *authFile) (remain int64, limit int64, packs int, err erro
 		limit += l
 		remain += l - used
 	}
-	return remain, limit, len(env.UserEntitlementPackList), nil
+	return remain, limit, len(env.UserEntitlementPackList), unlimited, nil
 }
 
 func main() {
@@ -136,12 +145,15 @@ func main() {
 			accounts = append(accounts, res)
 			continue
 		}
-		remain, limit, packs, err := fetchEntUsage(&af)
+		remain, limit, packs, unlimited, err := fetchEntUsage(&af)
 		if err != nil {
 			res.Error = err.Error()
 		} else {
-			res.Remain = &remain
-			res.Limit = &limit
+			res.Unlimited = unlimited
+			if !unlimited {
+				res.Remain = &remain
+				res.Limit = &limit
+			}
 			res.Packages = packs
 			res.OK = true
 		}

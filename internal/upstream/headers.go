@@ -51,7 +51,12 @@ func UgHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", clientUA)
 	req.Header.Set("Authorization", "Cloud-IDE-JWT "+a.JWT()) // 读锁快照
-	req.Header.Set("X-User-Region", "CN")
+	// 区域头：账号有 region 就带（全球站判区）；CN 账号缺省 CN（现状兼容）。
+	if a.Region != "" {
+		req.Header.Set("X-User-Region", a.Region)
+	} else {
+		req.Header.Set("X-User-Region", "CN")
+	}
 	if a.CheckinDeviceID != "" {
 		req.Header.Set("X-Device-Id", a.CheckinDeviceID)
 	}

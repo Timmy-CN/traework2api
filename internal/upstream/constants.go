@@ -26,6 +26,8 @@ const (
 	EpCheckinStatus = "/trae/api/v2/ug/checkin_credits/status"
 	EpCheckinClaim  = "/trae/api/v2/ug/checkin_credits/claim"
 	EpEntUsage      = "/trae/api/v2/pay/ide_user_ent_usage"
+	// EpDollarUsage 全球站的美元计费端点（插件 SITES["trae-global"].usage）。
+	EpDollarUsage = "/trae/api/v1/pay/user_current_entitlement_list"
 
 	// CodeCheckinRateLimited 签到 claim 的限流业务码（HTTP 200 返回）：需在
 	// Trae CN app 内签到，当天不再问（插件口径 ineligible）。

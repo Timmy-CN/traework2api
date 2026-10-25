@@ -15,13 +15,14 @@ import (
 )
 
 type row struct {
-	file   string
-	uid    string
-	nick   string
-	status string // OK | ALREADY | FAIL | AUTH_INVALID | LOAD_ERR
-	detail string
-	remain int64
-	hasRem bool
+	file      string
+	uid       string
+	nick      string
+	status    string // OK | ALREADY | FAIL | AUTH_INVALID | LOAD_ERR
+	detail    string
+	remain    int64
+	remainStr string // 非数字口径（"unlimited"）；非空优先于 remain
+	hasRem    bool
 }
 
 func main() {
@@ -127,9 +128,13 @@ func main() {
 				failN++
 			}
 		}
-		// 查积分
-		if remain, qerr := up.UserEntUsage(a); qerr == nil {
-			r.remain, r.hasRem = remain, true
+		// 查积分（无限包账号显示 unlimited）
+		if remain, unlimited, qerr := up.UserEntUsage(a); qerr == nil {
+			if unlimited {
+				r.remainStr, r.hasRem = "unlimited", true
+			} else {
+				r.remain, r.hasRem = remain, true
+			}
 		}
 		rows = append(rows, r)
 	}
@@ -140,7 +145,11 @@ func main() {
 	for _, r := range rows {
 		remain := "-"
 		if r.hasRem {
-			remain = fmt.Sprintf("%d", r.remain)
+			if r.remainStr != "" {
+				remain = r.remainStr
+			} else {
+				remain = fmt.Sprintf("%d", r.remain)
+			}
 		}
 		fmt.Printf("%-36s | %-11s | %-12s | %-6s | %s\n",
 			trunc(r.uid, 36), trunc(r.nick, 11), r.status, remain, r.detail)

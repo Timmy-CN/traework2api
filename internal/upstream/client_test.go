@@ -241,12 +241,37 @@ func TestUserEntUsageAggregation(t *testing.T) {
 			{"entitlement_base_info":{"quota":{"credits_limit":500}}}
 		]}`), nil
 	})
-	remain, err := c.UserEntUsage(&auth.Auth{AccessToken: "at"})
+	remain, unlimited, err := c.UserEntUsage(&auth.Auth{AccessToken: "at"})
 	if err != nil {
 		t.Fatalf("ent usage: %v", err)
 	}
-	if remain != 2500 {
-		t.Errorf("remain=%d want 2500", remain)
+	if remain != 2500 || unlimited {
+		t.Errorf("remain=%d unlimited=%v want 2500 false", remain, unlimited)
+	}
+}
+
+// TestUserEntUsageUnlimitedPack 无限包（credits_limit = -1，插件 credits
+// 口径）不计入 Σlimit，置 Unlimited；有限包正常求和。
+func TestUserEntUsageUnlimitedPack(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if !strings.HasSuffix(r.URL.Path, EpEntUsage) {
+			return nil, errors.New("wrong path: " + r.URL.Path)
+		}
+		return jsonResp(200, `{"is_credits_billing":true,"user_entitlement_pack_list":[
+			{"entitlement_base_info":{"quota":{"credits_limit":-1}}},
+			{"entitlement_base_info":{"quota":{"credits_limit":500}},"usage":{"credits_amount":120}}
+		]}`), nil
+	})
+	remain, unlimited, err := c.UserEntUsage(&auth.Auth{AccessToken: "at"})
+	if err != nil {
+		t.Fatalf("ent usage: %v", err)
+	}
+	// 旧实现把 -1 加进总额：2500 变 -7480 再钳 0，无限账号被显示成 0。
+	if !unlimited {
+		t.Errorf("unlimited=%v want true", unlimited)
+	}
+	if remain != 380 {
+		t.Errorf("remain=%d want 380（无限包不计入，有限包 500−120）", remain)
 	}
 }
 
@@ -365,8 +390,10 @@ func TestDailyCheckinVerifiesClaim(t *testing.T) {
 	if err == nil {
 		t.Fatal("claim accepted but still unchecked must fail verification")
 	}
-	if !strings.Contains(err.Error(), "verification failed") {
-		t.Errorf("want verification error, got %v", err)
+	// 插件 0.2.22 口径：claim 已发出，读回说什么就是当天的答案——未签上
+	// 记为当天不可再领取（ineligible），而不是可重试失败（那会二次 claim）。
+	if !errors.Is(err, ErrCheckinUnverified) {
+		t.Errorf("want ErrCheckinUnverified, got %v", err)
 	}
 	if statusCalls != 2 {
 		t.Errorf("status calls=%d want 2 (pre-check + verify)", statusCalls)
@@ -440,5 +467,36 @@ func TestCheckinStatusRejectsMissingStateFields(t *testing.T) {
 	_, _, _, err := c.CheckinStatus(&auth.Auth{AccessToken: "at"})
 	if err == nil || !strings.Contains(err.Error(), "missing checked_in or enable") {
 		t.Fatalf("error=%v want protocol failure", err)
+	}
+}
+
+// TestClassifyLapsedQuotaCodes 错误码集对齐插件 lapsedCode/quotaCode：
+// 4008/4011 → 额度软冷却；20101 → session 失效；403+文案双形态。
+func TestClassifyLapsedQuotaCodes(t *testing.T) {
+	if got := Classify(200, `{"code":4008,"message":"insufficient credits"}`); got != ErrSoftRate {
+		t.Errorf("4008 → %v want ErrSoftRate", got)
+	}
+	if got := Classify(200, `{"code":4011,"message":"额度已用完"}`); got != ErrSoftRate {
+		t.Errorf("4011 → %v want ErrSoftRate", got)
+	}
+	if got := Classify(200, `{"code":20101,"msg":"login required"}`); got != ErrSessionDead {
+		t.Errorf("20101 → %v want ErrSessionDead", got)
+	}
+	if got := Classify(403, `{"message":"未登录"}`); got != ErrSessionDead {
+		t.Errorf("403+lapsed words → %v want ErrSessionDead", got)
+	}
+	if got := Classify(403, `{"message":"quota exceeded"}`); got != ErrSoftRate {
+		t.Errorf("403+quota words → %v want ErrSoftRate", got)
+	}
+}
+
+// TestSOLOStreamErrorKinds 流内错误 Kind 映射对齐。
+func TestSOLOStreamErrorKinds(t *testing.T) {
+	for code, want := range map[int64]ErrKind{
+		1005: ErrPlanLimit, 4008: ErrSoftRate, 4011: ErrSoftRate, 1001: ErrSessionDead, 20101: ErrSessionDead,
+	} {
+		if got := (&SOLOStreamError{Code: code}).Kind(); got != want {
+			t.Errorf("code %d → %v want %v", code, got, want)
+		}
 	}
 }

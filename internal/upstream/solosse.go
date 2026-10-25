@@ -56,10 +56,17 @@ func (e *SOLOStreamError) Error() string {
 	return fmt.Sprintf("solo error code=%d msg=%s", e.Code, e.Msg)
 }
 
-// Kind 将 SSE 流内错误分类。1005 → ErrPlanLimit；其余归 ErrClient。
+// Kind 将 SSE 流内错误分类（码集对齐插件 lapsedCode/quotaCode）：1005 →
+// plan 硬冷却；4008/4011 → 额度软冷却；1001/20101 → session 失效禁用；其余
+// 归 ErrClient。
 func (e *SOLOStreamError) Kind() ErrKind {
-	if e.Code == 1005 {
+	switch e.Code {
+	case 1005:
 		return ErrPlanLimit
+	case 4008, 4011:
+		return ErrSoftRate
+	case 1001, 20101:
+		return ErrSessionDead
 	}
 	return ErrClient
 }

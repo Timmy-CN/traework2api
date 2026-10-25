@@ -31,7 +31,9 @@ func batchBody(groups map[string][]string) string {
 	return `{"function_configs":[` + strings.Join(gs, ",") + `]}`
 }
 
-func testAuth() *auth.Auth { return &auth.Auth{AccessToken: "at", UID: "u1", MachineID: "m1", DeviceID: "d1"} }
+func testAuth() *auth.Auth {
+	return &auth.Auth{AccessToken: "at", UID: "u1", MachineID: "m1", DeviceID: "d1"}
+}
 
 // TestBatchFirstFetchModels batch_get_detail_param 成功时不再逐 function 请求。
 func TestBatchFirstFetchModels(t *testing.T) {

@@ -12,15 +12,31 @@
 #   7. 自动签到 + 查积分 → 重启容器加载新账号
 #
 # 用法:
-#   ./login.sh
+#   ./login.sh              # Trae CN（trae.cn，默认）
+#   TRAE_SITE=global ./login.sh   # Trae 全球站（trae.ai）
 set -euo pipefail
 
 cd "$(dirname "$0")"
 AUTH_DIR="./auths"
 CONTAINER="traework2api"
-CLIENT_ID="en1oxy7wnw8j9n"          # SOLO stable
-APP_VERSION="0.1.43"
-API_HOST="https://api.trae.com.cn"  # ExchangeToken / GetUserInfo host（auth.apiHost）
+
+# 站点常量（插件 SITES 口径）：CN 与全球站的授权页/续期 host/client id 各异。
+TRAE_SITE="${TRAE_SITE:-cn}"
+if [[ "$TRAE_SITE" == "global" ]]; then
+    SITE_NAME="Trae Global (trae.ai)"
+    WEB_HOST="https://www.trae.ai"
+    CLIENT_ID="ono9krqynydwx5"          # Global 的 IDE
+    APP_VERSION="3.5.51"
+    API_HOST="https://growsg-normal.trae.ai"  # ExchangeToken / GetUserInfo host
+    SITE_DOMAIN="trae.ai"
+else
+    SITE_NAME="Trae CN (trae.cn)"
+    WEB_HOST="https://www.trae.cn"
+    CLIENT_ID="en1oxy7wnw8j9n"          # SOLO stable
+    APP_VERSION="0.1.43"
+    API_HOST="https://api.trae.com.cn"  # ExchangeToken / GetUserInfo host
+    SITE_DOMAIN="trae.cn"
+fi
 
 mkdir -p "$AUTH_DIR"
 
@@ -29,7 +45,7 @@ MACHINE_ID="$(openssl rand -hex 16 2>/dev/null || python3 -c 'import secrets;pri
 DEVICE_ID="$(openssl rand -hex 16 2>/dev/null || python3 -c 'import secrets;print(secrets.token_hex(16))')"
 
 echo "============================================================"
-echo "  TRAE SOLO 登录"
+echo "  TRAE SOLO 登录 — $SITE_NAME"
 echo "============================================================"
 echo ""
 echo "步骤："
@@ -39,7 +55,7 @@ echo "  3. 复制浏览器地址栏的完整链接，粘贴到下面"
 echo ""
 
 # ─── 构造登录链接（内嵌 python 保证 URL 编码正确）───
-LOGIN_URL="$(MACHINE_ID="$MACHINE_ID" DEVICE_ID="$DEVICE_ID" CLIENT_ID="$CLIENT_ID" APP_VERSION="$APP_VERSION" python3 - <<'PYEOF'
+LOGIN_URL="$(MACHINE_ID="$MACHINE_ID" DEVICE_ID="$DEVICE_ID" CLIENT_ID="$CLIENT_ID" APP_VERSION="$APP_VERSION" WEB_HOST="$WEB_HOST" python3 - <<'PYEOF'
 import os, secrets, urllib.parse
 
 params = {
@@ -62,7 +78,7 @@ params = {
     "x_app_version": os.environ["APP_VERSION"],
     "x_app_type": "stable",
 }
-print("https://www.trae.cn/authorization?" + urllib.parse.urlencode(params))
+print(os.environ["WEB_HOST"] + "/authorization?" + urllib.parse.urlencode(params))
 PYEOF
 )"
 
@@ -233,7 +249,7 @@ else
     echo "新账号（uid=$ACCT_UID），新增 auth 文件"
     ACTION="新增"
 fi
-MACHINE_ID="$MACHINE_ID" DEVICE_ID="$DEVICE_ID" TOKEN="$TOKEN" REFRESH="$REFRESH" EXPIRES_AT="$EXPIRES_AT" ACCT_UID="$ACCT_UID" NICKNAME="$NICKNAME" AUTH_FILE="$AUTH_FILE" ACTION="$ACTION" MODEL_HOST="$MODEL_HOST" AUTH_HOST="$AUTH_HOST" python3 - <<'PYEOF'
+MACHINE_ID="$MACHINE_ID" DEVICE_ID="$DEVICE_ID" TOKEN="$TOKEN" REFRESH="$REFRESH" EXPIRES_AT="$EXPIRES_AT" ACCT_UID="$ACCT_UID" NICKNAME="$NICKNAME" AUTH_FILE="$AUTH_FILE" ACTION="$ACTION" MODEL_HOST="$MODEL_HOST" AUTH_HOST="$AUTH_HOST" API_HOST="$API_HOST" SITE_DOMAIN="$SITE_DOMAIN" python3 - <<'PYEOF'
 import json, os
 auth = {
     "account": {"uid": os.environ["ACCT_UID"], "enterpriseId": "", "nickname": os.environ["NICKNAME"]},
@@ -241,8 +257,8 @@ auth = {
         "accessToken": os.environ["TOKEN"],
         "refreshToken": os.environ["REFRESH"],
         "expiresAt": int(os.environ["EXPIRES_AT"]),
-        "domain": "trae.cn",
-        "apiHost": "https://api.trae.com.cn",
+        "domain": os.environ["SITE_DOMAIN"],
+        "apiHost": os.environ["API_HOST"],
         "machineId": os.environ["MACHINE_ID"],
         "deviceId": os.environ["DEVICE_ID"],
         "modelHost": os.environ.get("MODEL_HOST", ""),
@@ -254,35 +270,54 @@ with open(os.environ["AUTH_FILE"], "w") as f:
 print(f"已保存（{os.environ['ACTION']}）: {os.environ['AUTH_FILE']}")
 PYEOF
 
-# ─── 自动签到 + 查积分 ─────────────────────────────
-TOKEN="$TOKEN" ACCT_UID="$ACCT_UID" DEVICE_ID="$DEVICE_ID" python3 - <<'PYEOF'
+# ─── 自动签到 + 查积分（全球站无签到页、走美元计费端点）───
+TOKEN="$TOKEN" ACCT_UID="$ACCT_UID" DEVICE_ID="$DEVICE_ID" TRAE_SITE="$TRAE_SITE" python3 - <<'PYEOF'
 import json, os, urllib.request
-UG = "https://api.trae.cn"
+if os.environ["TRAE_SITE"] == "global":
+    UG = "https://api-sg-central.trae.ai"
+else:
+    UG = "https://api.trae.cn"
 HDRS = {
     "Content-Type": "application/json",
     "Authorization": "Cloud-IDE-JWT " + os.environ["TOKEN"],
-    "X-User-Region": "CN",
     "X-Device-Id": os.environ["DEVICE_ID"],
 }
+if os.environ["TRAE_SITE"] != "global":
+    HDRS["X-User-Region"] = "CN"
 def post(path, body=b"{}"):
     req = urllib.request.Request(UG + path, method="POST", data=body, headers=HDRS)
     with urllib.request.urlopen(req, timeout=15) as r:
         return json.loads(r.read().decode() or "{}")
-try:
-    st = post("/trae/api/v2/ug/checkin_credits/status")
-    print(f"签到状态: checked_in={st.get('checked_in')} credits={st.get('credits')} enable={st.get('enable')}")
-    if not st.get("checked_in") and st.get("enable"):
-        r = post("/trae/api/v2/ug/checkin_credits/claim")
-        print(f"签到: {r.get('message', 'success')}")
-except Exception as e:
-    print(f"签到: {e}")
-try:
-    ent = post("/trae/api/v2/pay/ide_user_ent_usage")
-    packs = ent.get("user_entitlement_pack_list") or []
-    total = sum(p.get("entitlement_base_info", {}).get("quota", {}).get("credits_limit", 0) for p in packs)
-    print(f"当前积分: {total}")
-except Exception as e:
-    print(f"查积分: {e}")
+if os.environ["TRAE_SITE"] == "global":
+    try:
+        ent = post("/trae/api/v1/pay/user_current_entitlement_list")
+        packs = ent.get("user_entitlement_pack_list") or []
+        if packs:
+            q = packs[0].get("entitlement_base_info", {}).get("quota", {})
+            u = packs[0].get("usage", {})
+            basic = q.get("basic_usage_limit", 0); bonus = q.get("bonus_usage_limit", 0)
+            used = u.get("basic_usage_amount", 0) + u.get("bonus_usage_amount", 0)
+            print(f"套餐: {packs[0].get('display_desc', 'Free')}  已用 ${used} / ${basic + bonus}（含赠送 ${bonus}）")
+        else:
+            print("查积分: 无 entitlement 包")
+    except Exception as e:
+        print(f"查积分: {e}")
+else:
+    try:
+        st = post("/trae/api/v2/ug/checkin_credits/status")
+        print(f"签到状态: checked_in={st.get('checked_in')} credits={st.get('credits')} enable={st.get('enable')}")
+        if not st.get("checked_in") and st.get("enable"):
+            r = post("/trae/api/v2/ug/checkin_credits/claim")
+            print(f"签到: {r.get('message', 'success')}")
+    except Exception as e:
+        print(f"签到: {e}")
+    try:
+        ent = post("/trae/api/v2/pay/ide_user_ent_usage")
+        packs = ent.get("user_entitlement_pack_list") or []
+        total = sum(p.get("entitlement_base_info", {}).get("quota", {}).get("credits_limit", 0) for p in packs)
+        print(f"当前积分: {total}")
+    except Exception as e:
+        print(f"查积分: {e}")
 PYEOF
 
 # ─── 重启容器加载新账号 ──────────────────────────

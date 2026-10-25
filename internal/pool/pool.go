@@ -5,6 +5,7 @@ package pool
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -37,22 +38,35 @@ func (k CoolKind) String() string {
 
 // Status 单个账号对外暴露的状态（脱敏，不含 token）。
 type Status struct {
-	UID      string    `json:"uid"`
-	Nickname string    `json:"nickname,omitempty"`
-	Credits  int64     `json:"credits"`
-	Cooling  bool      `json:"cooling"`
-	Until    time.Time `json:"until,omitempty"`
-	Reason   string    `json:"reason,omitempty"`
-	Disabled bool      `json:"disabled"`
-	ErrCount int       `json:"err_count,omitempty"`
+	UID      string `json:"uid"`
+	Nickname string `json:"nickname,omitempty"`
+	Credits  int64  `json:"credits"`
+	// Unlimited 权益含无限包（credits_limit = -1）：credits 无意义，展示按
+	// 「unlimited」，选号权重恒最高。
+	Unlimited bool `json:"unlimited,omitempty"`
+	// Plan 套餐名（全球站美元计费 display_desc；CN credits 口径为
+	// Credits/Free）；UsageUntil 最近到期（毫秒，0=没说）。
+	Plan       string    `json:"plan,omitempty"`
+	UsageUntil int64     `json:"usage_until,omitempty"`
+	Cooling    bool      `json:"cooling"`
+	Until      time.Time `json:"until,omitempty"`
+	Reason     string    `json:"reason,omitempty"`
+	Disabled   bool      `json:"disabled"`
+	ErrCount   int       `json:"err_count,omitempty"`
 	// CheckinIneligibleDay 该账号当天不可签到的本地日期（9095/9074），
 	// 过期后自动失效；空表示可签到。
 	CheckinIneligibleDay string `json:"checkin_ineligible_day,omitempty"`
 }
 
 type entry struct {
-	a        *auth.Auth
-	credits  int64
+	a          *auth.Auth
+	credits    int64
+	unlimited  bool   // 权益含无限包（credits_limit = -1）
+	plan       string // 套餐名（/status 展示）
+	usageUntil int64  // 最近到期毫秒（/status 展示）
+	// lastFn 该账号上次聊天成功的 function（轮换候选序第二位，
+	// 插件 fnOf 口径；目录归属缺失时的账号级兜底）。
+	lastFn   string
 	disabled bool
 	reason   string
 	until    time.Time
@@ -75,6 +89,7 @@ func (e *entry) healthy(now time.Time) bool {
 type stateFile struct {
 	Accounts map[string]struct {
 		Credits              int64     `json:"credits"`
+		Unlimited            bool      `json:"unlimited,omitempty"`
 		Disabled             bool      `json:"disabled"`
 		Reason               string    `json:"reason,omitempty"`
 		Until                time.Time `json:"until,omitempty"`
@@ -205,6 +220,57 @@ func (p *Pool) ReenableIfCredits(uid string, remain int64) {
 	p.saveLocked()
 }
 
+// ReenableUnlimited 记无限包账号：credits 权重取最大（Pick 恒优先），
+// Unlimited 置位供状态展示，冷却照常解除。
+func (p *Pool) ReenableUnlimited(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.credits = math.MaxInt64
+		e.unlimited = true
+		if !e.disabled {
+			e.until = time.Time{}
+			e.reason = ""
+			e.errCount = 0
+		}
+	}
+	p.saveLocked()
+}
+
+// LastFunction 账号上次聊天成功的 function；没有 → 空。
+func (p *Pool) LastFunction(uid string) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if e, ok := p.byUID[uid]; ok {
+		return e.lastFn
+	}
+	return ""
+}
+
+// SetLastFunction 记账号上次聊天成功的 function。
+func (p *Pool) SetLastFunction(uid, fn string) {
+	if fn == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.lastFn = fn
+	}
+	p.saveLocked()
+}
+
+// SetUsageMeta 记账号的套餐名与最近到期（/status 展示；插件 usage.read 口径）。
+func (p *Pool) SetUsageMeta(uid, plan string, untilMs int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.plan = plan
+		e.usageUntil = untilMs
+	}
+	p.saveLocked()
+}
+
 // MarkCheckinIneligible 记录账号当天不可领取（claim 业务码 9095/9074）：
 // 当天后续轮次跳过签到，次日自动恢复。
 func (p *Pool) MarkCheckinIneligible(uid string) {
@@ -304,6 +370,9 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		UID:                  uid,
 		Nickname:             e.a.Nickname,
 		Credits:              e.credits,
+		Unlimited:            e.unlimited,
+		Plan:                 e.plan,
+		UsageUntil:           e.usageUntil,
 		Cooling:              !e.until.IsZero() && now.Before(e.until),
 		Until:                e.until,
 		Reason:               e.reason,
@@ -330,6 +399,7 @@ func (p *Pool) load() {
 		p.byUID[uid] = &entry{
 			a:                    &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
 			credits:              s.Credits,
+			unlimited:            s.Unlimited,
 			disabled:             s.Disabled,
 			reason:               s.Reason,
 			until:                s.Until,
@@ -344,6 +414,7 @@ func (p *Pool) saveLocked() {
 	}
 	sf := stateFile{Accounts: map[string]struct {
 		Credits              int64     `json:"credits"`
+		Unlimited            bool      `json:"unlimited,omitempty"`
 		Disabled             bool      `json:"disabled"`
 		Reason               string    `json:"reason,omitempty"`
 		Until                time.Time `json:"until,omitempty"`
@@ -352,12 +423,14 @@ func (p *Pool) saveLocked() {
 	for uid, e := range p.byUID {
 		sf.Accounts[uid] = struct {
 			Credits              int64     `json:"credits"`
+			Unlimited            bool      `json:"unlimited,omitempty"`
 			Disabled             bool      `json:"disabled"`
 			Reason               string    `json:"reason,omitempty"`
 			Until                time.Time `json:"until,omitempty"`
 			CheckinIneligibleDay string    `json:"checkin_ineligible_day,omitempty"`
 		}{
 			Credits:              e.credits,
+			Unlimited:            e.unlimited,
 			Disabled:             e.disabled,
 			Reason:               e.reason,
 			Until:                e.until,

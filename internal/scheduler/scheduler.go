@@ -106,13 +106,23 @@ func (s *Scheduler) RunCheckinNow() {
 			// 签到设备门控（PR #9）：凭证缺独立签到设备标识时，尝试从本机已登录的
 			// 官方客户端自动读取并写回凭证（Docker 容器内读不到宿主机客户端数据，
 			// 会走到下面的跳过分支）。
-			if id, brand, typ, ok := auth.DetectLocalCheckinDevice(); ok {
+			if id, brand, typ, ok := auth.DetectCheckinDeviceForUID(st.UID); ok {
 				a.CheckinDeviceID, a.CheckinDeviceBrand, a.CheckinDeviceType = id, brand, typ
 				if err := a.SaveAtomic(); err != nil {
 					log.Printf("checkin %s: 自动读取签到设备ID成功但写回失败: %v", st.UID, err)
 				} else {
 					log.Printf("checkin %s: 已从本机官方客户端自动读取签到设备ID并写回凭证", st.UID)
 				}
+			}
+		}
+		if a.CheckinDeviceID == "" {
+			// 插件口径（#194/#361）：本机客户端没有以该账号登录时，签到走
+			// 账号自己的派生设备 id（登录设备 + uid 派生，16 位，稳定不轮换，
+			// 绝不是别的账号的设备），而不是跳过签到。派生结果不落盘——
+			// 之后 profile 匹配到真客户端设备时仍以真设备为准。
+			if derived := auth.UgDevice(a.DeviceID, st.UID); derived != "" {
+				a.CheckinDeviceID = derived
+				log.Printf("checkin %s: 本机客户端未以该账号登录，使用派生签到设备ID签到", st.UID)
 			}
 		}
 		if a.CheckinDeviceID == "" {
@@ -134,6 +144,11 @@ func (s *Scheduler) RunCheckinNow() {
 			switch err := s.cfg.Upstream.DailyCheckin(a); {
 			case err == nil:
 				log.Printf("checkin %s: ok", st.UID)
+			case errors.Is(err, upstream.ErrCheckinUnverified):
+				// claim 已发出但读回未能确认（复核未签上/读回失败）：当天
+				// 不可再领取，避免重复领取（插件 0.2.22 口径）。
+				s.cfg.Pool.MarkCheckinIneligible(st.UID)
+				log.Printf("checkin verify uid=%s: claim 已发出但读回未确认，当天不可再领取: %v", st.UID, err)
 			case errors.Is(err, upstream.ErrAlreadyCheckedIn):
 				log.Printf("checkin %s: already checked in", st.UID)
 			case errors.Is(err, upstream.ErrCheckinDisabled):
@@ -153,14 +168,31 @@ func (s *Scheduler) RunCheckinNow() {
 				}
 			}
 		}
-		// 查积分 + 解冻
-		remain, err := s.cfg.Upstream.UserEntUsage(a)
+		// 查积分 + 解冻（无限包账号按无限口径：credits 无意义，恒解冻）；
+		// 顺带记套餐名与最近到期（/status 展示，插件 usage.read 口径）。
+		remain, unlimited, err := s.cfg.Upstream.UserEntUsage(a)
 		if err != nil {
 			log.Printf("ent-usage %s: %v", st.UID, err)
 			continue
 		}
-		log.Printf("ent-usage %s: remain=%d", st.UID, remain)
-		s.cfg.Pool.ReenableIfCredits(st.UID, remain)
+		if site := s.cfg.Upstream.SiteMeta(a); site.DollarUsage {
+			if d, derr := s.cfg.Upstream.DollarEntUsage(a); derr == nil {
+				plan := d.Plan
+				if plan == "" {
+					plan = "Free"
+				}
+				s.cfg.Pool.SetUsageMeta(st.UID, plan, d.EndMs)
+			}
+		} else if until, uerr := s.cfg.Upstream.CreditsUntil(a); uerr == nil {
+			s.cfg.Pool.SetUsageMeta(st.UID, "Credits", until)
+		}
+		if unlimited {
+			log.Printf("ent-usage %s: unlimited", st.UID)
+			s.cfg.Pool.ReenableUnlimited(st.UID)
+		} else {
+			log.Printf("ent-usage %s: remain=%d", st.UID, remain)
+			s.cfg.Pool.ReenableIfCredits(st.UID, remain)
+		}
 	}
 }
 

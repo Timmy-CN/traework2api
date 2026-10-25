@@ -54,7 +54,7 @@ func sessionSaltValue() string {
 }
 
 // uuidFromSession 由派生串的 sha256 前 16 字节造一个 v4 UUID 形状的 id
-//（session_id 此前承载的就是 randomUUID 的形状）。
+// （session_id 此前承载的就是 randomUUID 的形状）。
 func uuidFromSession(s string) string {
 	sum := sha256.Sum256([]byte(sessionSaltValue() + "|" + s))
 	b := sum[:16]
@@ -71,7 +71,7 @@ func uuidFromSession(s string) string {
 //     请求一个新对话正是要消除的碎片化。
 //
 // who 是本次请求的账号身份（uid，缺则昵称）：同一段对话被两个账号应答
-//（轮转/failover）时按两个对话记，防止 Trae 把一个账号的对话读成另一个的。
+// （轮转/failover）时按两个对话记，防止 Trae 把一个账号的对话读成另一个的。
 func conversationID(msgs []any, session, who string) string {
 	account := strings.TrimSpace(who)
 	if session != "" {
@@ -191,7 +191,7 @@ type reshapedTurn struct {
 	role   string // assistant | tool | user | system
 	text   string
 	images []any
-	calls  []any // SOLO function_call 对象（assistant 专用）
+	calls  []any  // SOLO function_call 对象（assistant 专用）
 	callID string // tool 专用
 }
 
@@ -213,8 +213,8 @@ func reshapeMessages(obj map[string]any, sees bool) {
 		}
 	}
 
-	names := map[string]string{}   // call id -> 工具名
-	dropped := map[string]bool{}   // 无法发送的调用 id（其结果整组带走）
+	names := map[string]string{} // call id -> 工具名
+	dropped := map[string]bool{} // 无法发送的调用 id（其结果整组带走）
 	out := make([]reshapedTurn, 0, len(rawMsgs))
 	pendingImages := []any{}
 	flushImages := func() {

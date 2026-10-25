@@ -203,10 +203,10 @@ func (c *Client) deviceBoundExchange(ctx context.Context, a *auth.Auth) (access,
 		}
 		var parsed struct {
 			Result struct {
-				Token                string `json:"Token"`
-				TokenExpireAt        int64  `json:"TokenExpireAt"`
-				TokenExpireDuration  int64  `json:"TokenExpireDuration"`
-				RefreshToken         string `json:"RefreshToken"`
+				Token               string `json:"Token"`
+				TokenExpireAt       int64  `json:"TokenExpireAt"`
+				TokenExpireDuration int64  `json:"TokenExpireDuration"`
+				RefreshToken        string `json:"RefreshToken"`
 			} `json:"Result"`
 			ResultLower struct {
 				Token               string `json:"token"`

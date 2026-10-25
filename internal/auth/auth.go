@@ -25,8 +25,9 @@ type Auth struct {
 	AccessToken        string // Cloud-IDE-JWT 头用
 	RefreshToken       string // 每次 ExchangeToken 轮换
 	ExpiresAt          int64  // Unix 秒（accessToken 过期时刻）
-	Domain             string // "trae.cn"
+	Domain             string // "trae.cn" / "trae.ai"
 	ApiHost            string // "https://api.trae.com.cn"（ExchangeToken host）
+	Region             string // 账号区域（GetUserInfo 的 region/aiRegion）；US 开头 → 全球站
 	ModelHost          string // 企业租户的模型网关（个人账号为空 → 用默认 agent host）
 	AuthHost           string // 企业租户的续期 host（个人账号为空 → 用默认 OAuth host）
 	MachineID          string // 模型通道 x-machine-id
@@ -101,11 +102,12 @@ func parseNested(raw []byte) (*Auth, error) {
 			AuthHost           string `json:"authHost"`
 			MachineID          string `json:"machineId"`
 			DeviceID           string `json:"deviceId"`
+			Region             string `json:"region,omitempty"`
 			CheckinDeviceID    string `json:"checkinDeviceId"`
 			CheckinDeviceBrand string `json:"checkinDeviceBrand"`
 			CheckinDeviceType  string `json:"checkinDeviceType"`
-			DevicePublicKey   string `json:"devicePublicKey"`
-			DevicePrivateKey  string `json:"devicePrivateKey"`
+			DevicePublicKey    string `json:"devicePublicKey"`
+			DevicePrivateKey   string `json:"devicePrivateKey"`
 		} `json:"auth"`
 		Account struct {
 			UID          string `json:"uid"`
@@ -122,6 +124,7 @@ func parseNested(raw []byte) (*Auth, error) {
 		ExpiresAt:          n.Auth.ExpiresAt,
 		Domain:             n.Auth.Domain,
 		ApiHost:            n.Auth.ApiHost,
+		Region:             n.Auth.Region,
 		ModelHost:          n.Auth.ModelHost,
 		AuthHost:           n.Auth.AuthHost,
 		MachineID:          n.Auth.MachineID,
@@ -227,6 +230,7 @@ func (a *Auth) saveAtomicLocked() error {
 			"refreshToken":       a.RefreshToken,
 			"expiresAt":          a.ExpiresAt,
 			"domain":             a.Domain,
+			"region":             a.Region,
 			"apiHost":            a.ApiHost,
 			"modelHost":          a.ModelHost,
 			"authHost":           a.AuthHost,

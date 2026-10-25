@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"traework2api/internal/pool"
@@ -405,14 +406,28 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	body = setModelInBody(body, configName)
 
-	// 目录信息：请求 function、Max 模式、multimodal、reasoning levels。
-	// 目录不可用时全部按默认（function 默认、sees=false、无等级）。
+	// Max 语义（插件 named?.max 口径）：仅客户端点名 <id>-max 时进 Max 模式，
+	// config_name 用 base id（payload 以 Max.Base 为准）；base 请求绝不携带
+	// Max——目录给 base 挂的 __max 细目只说明「有 Max 档」，不代表请求要走
+	// Max。fn/sees/levels 一律按 base 条目查（-max 条目未拷 levels）。
+	chatID, isMaxReq := upstream.SplitMaxID(configName)
 	infos := h.fetchDynamicModels()
 	cat := h.catalogOf(infos)
-	fn := h.chatFunction(cat, configName)
-	max := h.maxModeOf(cat, configName)
-	sees := h.seesOf(cat, configName)
-	levels := h.levelsOf(cat, configName)
+	// REREAD_MS（插件口径）：目录没有该模型（列表漂移/未列名的 -max）时，
+	// 按 5min 节流重读一次目录再重建；重读也没有就按现状走（负缓存语义）。
+	if cat != nil && !cat.Has(chatID) {
+		h.rereadModels()
+		if infos = h.fetchDynamicModels(); len(infos) > 0 {
+			cat = h.catalogOf(infos)
+		}
+	}
+	fn := h.chatFunction(cat, chatID)
+	max := h.maxModeOf(cat, chatID)
+	if !isMaxReq {
+		max = nil
+	}
+	sees := h.seesOf(cat, chatID)
+	levels := h.levelsOf(cat, chatID)
 
 	tried := map[string]bool{}
 	// wrongFunction 回退：同一账号先试目录 function，被 4001/4023/1005 拒时
@@ -455,18 +470,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			who = acct.Nickname
 		}
 
-		// 本账号内 function 轮换：目录 function 优先，其余按目录顺序补齐
-		// （README:89-92 / 插件 wrongFunction：4001/4023/1005 = 该 function
-		// 不收这个模型，换一个再试）。已试集合按账号隔离（换号后重新轮换）。
+		// 本账号内 function 轮换：目录 function → 默认 → 完整花名册（去重
+		// 保序，插件 fns 口径），wrongFunction 码（4001/4023/1005 = 该
+		// function 不收这个模型）按顺序试下一个；1005 在轮换试尽后才按
+		// plan 权益冷却换号。已试集合按账号隔离（换号后重新轮换）。
 		fnsTried := map[string]bool{}
 		curFn := fn
 		if curFn == "" {
 			curFn = upstream.Function
 		}
 		for {
-			if fnsTried[curFn] {
-				break
-			}
 			fnsTried[curFn] = true
 			rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body, upstream.ChatOpts{
 				Function: curFn, Model: configName, Max: max, Sees: sees, Levels: levels,
@@ -478,8 +491,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			if status >= 400 {
 				kind := upstream.Classify(status, string(respBody))
-				if upstream.WrongFunctionCode(upstream.ErrorCodeOf(respBody)) {
-					if next, ok := h.nextFunction(cat, configName, curFn); ok {
+				code := upstream.ErrorCodeOf(respBody)
+				if kind != upstream.ErrPlanLimit && upstream.WrongFunctionCode(code) {
+					if next, ok := h.nextFunction(cat, configName, h.cfg.Pool.LastFunction(acct.UID), fnsTried); ok {
 						curFn = next
 						continue
 					}
@@ -504,17 +518,30 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 				break
 			}
-			// 流内错误路由：wrongFunction 码（4001/4023/1005 之外的语义
-			// 见下）换 function 重试同账号一次；1005 plan → 冷却后换号；
-			// 其他 → 累计错误换号。成功后目录里该模型的 function 归属更新。
+			// 流内错误路由：wrongFunction 码（4001/4023/1005）换 function
+			// 重试同账号；轮换试尽后 1005 → plan 冷却换号，其他 → 累计
+			// 错误换号。成功后目录里该模型的 function 归属更新。
 			se, handled := h.serveChat(w, acct.UID, rc, peek.Stream)
 			if handled {
+				if se == nil {
+					// 成功（插件 listedBy.set/fnOf.set 口径）：目录归属与该账号
+					// 的最后成功 function 一并更新——回退成功的 function 下次
+					// 直达，不再先吃一个 4001。
+					h.reassignFunction(configName, curFn)
+					h.cfg.Pool.SetLastFunction(acct.UID, curFn)
+				}
 				return
 			}
-			if se != nil && upstream.WrongFunctionCode(se.Code) && se.Kind() != upstream.ErrPlanLimit {
-				if next, ok2 := h.nextFunction(cat, configName, curFn); ok2 {
+			if se != nil && upstream.WrongFunctionCode(se.Code) {
+				if next, ok2 := h.nextFunction(cat, configName, h.cfg.Pool.LastFunction(acct.UID), fnsTried); ok2 {
 					curFn = next
 					continue
+				}
+				if se.Code == 1005 {
+					// 每个可试 function 都拒收：按 plan 权益冷却换号。
+					h.cfg.Pool.Cooldown(acct.UID, pool.CoolPlan, h.cfg.PlanCooldown, "plan 权益不足")
+					lastErr = &upstream.Error{Kind: upstream.ErrPlanLimit, Status: 200, Msg: se.Error()}
+					break
 				}
 			}
 			if se != nil {
@@ -536,6 +563,12 @@ func (h *Handler) handleStreamError(uid string, se *upstream.SOLOStreamError) {
 	switch se.Kind() {
 	case upstream.ErrPlanLimit:
 		h.cfg.Pool.Cooldown(uid, pool.CoolPlan, h.cfg.PlanCooldown, "plan 权益不足")
+	case upstream.ErrSoftRate:
+		// 4008/4011（插件 quotaCode → 429 口径）：短冷却
+		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "quota/rate limit")
+	case upstream.ErrSessionDead:
+		// 1001/20101（插件 lapsedCode 口径）：禁用等重登
+		h.cfg.Pool.Disable(uid, "session dead")
 	default:
 		h.cfg.Pool.NoteError(uid, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 	}
@@ -594,11 +627,82 @@ func (h *Handler) levelsOf(cat upstream.Catalog, id string) []string {
 	return cat.LevelsOf(id)
 }
 
-// nextFunction wrongFunction 回退的下一个 function：目录顺序里换一个
-// 未试过的（插件 fns 列表轮换同口径）。
-func (h *Handler) nextFunction(cat upstream.Catalog, id, cur string) (string, bool) {
+// rereadInterval 目录重读节流（插件 REREAD_MS = 5min）。
+const rereadInterval = 5 * time.Minute
+
+var lastModelsReread atomic.Int64 // UnixNano；0 = 没读过
+
+// rereadModels 强制重读模型目录（绕过成功 TTL 与失败负缓存），按
+// rereadInterval 节流；并发请求共享同一次重读（插件 readList 的 in-flight
+// 共享语义在节流层面等价）。
+func (h *Handler) rereadModels() {
+	now := time.Now().UnixNano()
+	last := lastModelsReread.Load()
+	if last != 0 && time.Since(time.Unix(0, last)) < rereadInterval {
+		return
+	}
+	if !lastModelsReread.CompareAndSwap(last, now) {
+		return // 别的请求刚触发过
+	}
+	acct := h.cfg.Pool.Pick()
+	if acct == nil {
+		return
+	}
+	infos, err := h.cfg.Upstream.FetchModels(acct)
+	if err != nil || len(infos) == 0 {
+		return
+	}
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.ids = infos
+	dynamicModelsCache.fetched = time.Now()
+	dynamicModelsCache.Unlock()
+}
+
+// reassignFunction 聊天成功后更新缓存目录里该模型的 function 归属；
+// 缓存未命中（目录刚失效/静态回退）时静默跳过。
+func (h *Handler) reassignFunction(id, fn string) {
+	if fn == "" {
+		return
+	}
+	dynamicModelsCache.Lock()
+	defer dynamicModelsCache.Unlock()
+	for i := range dynamicModelsCache.ids {
+		if dynamicModelsCache.ids[i].ID == id {
+			dynamicModelsCache.ids[i].Function = fn
+			return
+		}
+	}
+}
+
+// functionCandidates wrongFunction 回退的候选顺序（插件 fns 口径）：
+// 目录里该模型的归属 function → 该账号上次成功的 function → 默认 function
+// → 完整花名册，去重保序。
+func functionCandidates(cat upstream.Catalog, id, lastFn string) []string {
+	var fns []string
+	seen := map[string]bool{}
+	add := func(fn string) {
+		if fn != "" && !seen[fn] {
+			seen[fn] = true
+			fns = append(fns, fn)
+		}
+	}
+	if cat != nil {
+		add(cat.FunctionOf(id))
+	}
+	add(lastFn)
+	add(upstream.Function)
 	for _, fn := range upstream.ChatFunctions() {
-		if fn != cur {
+		add(fn)
+	}
+	return fns
+}
+
+// nextFunction wrongFunction 回退的下一个 function：候选顺序里第一个
+// 未试过的（插件 for-fn 轮换同口径）；全试过 → false。tried 由调用方
+// 维护（按账号隔离，换号后重新轮换）。
+func (h *Handler) nextFunction(cat upstream.Catalog, id, lastFn string, tried map[string]bool) (string, bool) {
+	for _, fn := range functionCandidates(cat, id, lastFn) {
+		if !tried[fn] {
 			return fn, true
 		}
 	}
@@ -641,7 +745,7 @@ func (h *Handler) serveChat(w http.ResponseWriter, uid string, rc io.ReadCloser,
 }
 
 // peekFirstEvent 读首个 SSE 事件（至首个空行）：replay 是已读的原始字节
-//（须回放给消费者），rest 是持有 bufio 缓冲的剩余流；event:error → se。
+// （须回放给消费者），rest 是持有 bufio 缓冲的剩余流；event:error → se。
 func peekFirstEvent(rc io.Reader) (replay []byte, se *upstream.SOLOStreamError, rest io.Reader) {
 	br := bufio.NewReaderSize(rc, 64<<10)
 	var buf bytes.Buffer

@@ -31,7 +31,9 @@ docker compose up -d --build
 # 4. 验证
 curl http://127.0.0.1:7864/healthz          # → ok
 curl http://127.0.0.1:7864/v1/models         # → 模型列表
-curl http://127.0.0.1:7864/status            # → 账号状态
+curl http://127.0.0.1:7864/status            # → 账号状态（权益含无限包时
+                                             #   credits 为 0 且 "unlimited": true，
+                                             #   选号恒优先）
 
 # 5. 对话
 curl -X POST http://127.0.0.1:7864/v1/chat/completions \
@@ -103,9 +105,25 @@ go build -o tw2api ./cmd/server
 `checkinDeviceId` / `checkinDeviceBrand` / `checkinDeviceType`。
 
 **自动获取（默认，推荐）**：`signin.sh` 或自动签到调度器发现凭证缺
-`checkinDeviceId` 时，会自动从**本机已登录的 TRAE SOLO 官方客户端**本地数据
-读取设备标识（macOS / Windows），并写回凭证文件，之后容器内调度器直接复用。
-可用 `TW2A_DISABLE_CHECKIN_DETECT=1` 关闭该探测。
+`checkinDeviceId` 时，按顺序取设备标识（对齐插件 0.2.22，#361/#194）：
+
+1. **本机官方客户端 profile 匹配**：枚举本机 `Trae CN` / `TRAE SOLO CN` /
+   `trae-cn` 三个 profile 的 `User/globalStorage/storage.json`（macOS 的
+   `Application Support`、Windows 的 `%APPDATA%` 与 `home\AppData\Roaming`
+   双 root 去重、Linux 的 XDG `config`），解出每个 profile 登录的账号
+   （`iCubeAuthInfo://icube.cloudide` envelope，明文 JSON 或客户端
+   AES-128-CBC 编码）与设备 id（`iCubeAuthInfo://icube-dc:<id>`，恰好一个
+   8~20 位数字）；**只有以该账号 uid 登录的 profile 才会命中**——两个账号
+   各用各的客户端设备，绝不互借（互借会被上游关联）。
+2. **账号自身派生设备**：本机客户端没有以该账号登录时，签到改用账号自己的
+   派生设备 id（`sha256("trae-cn-device\0<登录deviceId>\0<uid>")` 派生的
+   16 位数字，插件 ugDevice 口径，#194 实测可用；同一账号恒定不轮换，不落盘，
+   之后 profile 命中真设备仍以真设备为准）。登录设备 id 与 uid 都为空的账号
+   派生不出设备，才会被**明确跳过并打印原因**——不发无设备头的无效请求，
+   也不生成上游无法识别的随机假 ID。
+
+可用 `TW2A_DISABLE_CHECKIN_DETECT=1` 关闭第 1 步的本机数据读取（派生设备
+不受影响）。
 
 **手动获取**（账号的官方客户端登录在**另一台设备**上时，需到那台设备上取）：
 
@@ -125,9 +143,9 @@ Get-ChildItem "$env:APPDATA\TRAE SOLO CN\Local Storage\leveldb" -Include *.log,*
 # checkinDeviceType 填 "windows"
 ```
 
-把三个值填进 `auths/trae-<uid>.json` 的 `auth` 段即可。既无本机客户端、
-凭证也缺字段时，签到会被**明确跳过并打印原因**——不会发无设备头的无效请求，
-也不会生成上游无法识别的随机假 ID。
+把三个值填进 `auths/trae-<uid>.json` 的 `auth` 段即可。凭证缺字段、
+本机客户端也没有以该账号登录、且登录设备 id 与 uid 都为空时，签到才会被
+**明确跳过并打印原因**。
 
 ## 目录结构
 
