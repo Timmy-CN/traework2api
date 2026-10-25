@@ -94,105 +94,129 @@ func (s *Scheduler) RunCheckinNow() {
 		if st.Disabled {
 			continue
 		}
-		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshTokenValue() == "" {
+		if a := s.cfg.Pool.AuthByUID(st.UID); a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
-		// 签到门控：9095（本设备今日已签，done 口径）/ 9074（需在 CN app 内签）
-		// 当天不可领取，当天后续轮次跳过签到，但状态/额度查询照常，次日自动恢复。
-		if s.cfg.Pool.CheckinIneligibleToday(st.UID) {
-			log.Printf("checkin %s: skip, 当天不可领取（9095/9074），次日恢复", st.UID)
-		} else if a.CheckinDeviceID == "" {
-			// 签到设备门控（PR #9）：凭证缺独立签到设备标识时，尝试从本机已登录的
-			// 官方客户端自动读取并写回凭证（Docker 容器内读不到宿主机客户端数据，
-			// 会走到下面的跳过分支）。
-			if id, brand, typ, ok := auth.DetectCheckinDeviceForUID(st.UID); ok {
-				a.CheckinDeviceID, a.CheckinDeviceBrand, a.CheckinDeviceType = id, brand, typ
-				if err := a.SaveAtomic(); err != nil {
-					log.Printf("checkin %s: 自动读取签到设备ID成功但写回失败: %v", st.UID, err)
-				} else {
-					log.Printf("checkin %s: 已从本机官方客户端自动读取签到设备ID并写回凭证", st.UID)
-				}
+		s.checkinAccount(st)
+	}
+}
+
+// CheckinOne 触发单账号签到（admin API 用）；账号不存在返回 false。
+func (s *Scheduler) CheckinOne(uid string) bool {
+	for _, st := range s.cfg.Pool.List() {
+		if st.UID != uid {
+			continue
+		}
+		if a := s.cfg.Pool.AuthByUID(st.UID); a == nil || a.RefreshTokenValue() == "" {
+			return false
+		}
+		s.checkinAccount(st)
+		return true
+	}
+	return false
+}
+
+// checkinAccount 单账号签到闭环（RunCheckinNow / CheckinOne 共用）：
+// 设备兜底 → 签到前兜底刷新 → DailyCheckin → ent-usage + 解冻。
+func (s *Scheduler) checkinAccount(st pool.Status) {
+	a := s.cfg.Pool.AuthByUID(st.UID)
+	if a == nil || a.RefreshTokenValue() == "" {
+		return
+	}
+	// 签到门控：9095（本设备今日已签，done 口径）/ 9074（需在 CN app 内签）
+	// 当天不可领取，当天后续轮次跳过签到，但状态/额度查询照常，次日自动恢复。
+	if s.cfg.Pool.CheckinIneligibleToday(st.UID) {
+		log.Printf("checkin %s: skip, 当天不可领取（9095/9074），次日恢复", st.UID)
+	} else if a.CheckinDeviceID == "" {
+		// 签到设备门控（PR #9）：凭证缺独立签到设备标识时，尝试从本机已登录的
+		// 官方客户端自动读取并写回凭证（Docker 容器内读不到宿主机客户端数据，
+		// 会走到下面的跳过分支）。
+		if id, brand, typ, ok := auth.DetectCheckinDeviceForUID(st.UID); ok {
+			a.CheckinDeviceID, a.CheckinDeviceBrand, a.CheckinDeviceType = id, brand, typ
+			if err := a.SaveAtomic(); err != nil {
+				log.Printf("checkin %s: 自动读取签到设备ID成功但写回失败: %v", st.UID, err)
+			} else {
+				log.Printf("checkin %s: 已从本机官方客户端自动读取签到设备ID并写回凭证", st.UID)
 			}
 		}
-		if a.CheckinDeviceID == "" {
-			// 插件口径（#194/#361）：本机客户端没有以该账号登录时，签到走
-			// 账号自己的派生设备 id（登录设备 + uid 派生，16 位，稳定不轮换，
-			// 绝不是别的账号的设备），而不是跳过签到。派生结果不落盘——
-			// 之后 profile 匹配到真客户端设备时仍以真设备为准。
-			if derived := auth.UgDevice(a.DeviceID, st.UID); derived != "" {
-				a.CheckinDeviceID = derived
-				log.Printf("checkin %s: 本机客户端未以该账号登录，使用派生签到设备ID签到", st.UID)
+	}
+	if a.CheckinDeviceID == "" {
+		// 插件口径（#194/#361）：本机客户端没有以该账号登录时，签到走
+		// 账号自己的派生设备 id（登录设备 + uid 派生，16 位，稳定不轮换，
+		// 绝不是别的账号的设备），而不是跳过签到。派生结果不落盘——
+		// 之后 profile 匹配到真客户端设备时仍以真设备为准。
+		if derived := auth.UgDevice(a.DeviceID, st.UID); derived != "" {
+			a.CheckinDeviceID = derived
+			log.Printf("checkin %s: 本机客户端未以该账号登录，使用派生签到设备ID签到", st.UID)
+		}
+	}
+	if a.CheckinDeviceID == "" {
+		// 凭证缺少独立签到设备标识且本机检测不到官方客户端：多账号签到
+		// 要求各账号使用不同的设备 ID，缺字段时明确跳过并说明，不发无设备头的
+		// 无效请求，也不生成随机假 ID（上游无法识别，签到永远不会生效）。
+		log.Printf("checkin %s: skip, 缺签到设备ID且本机未检测到官方客户端（在已登录官方客户端的机器上跑 signin.sh 可自动读取并写回凭证；手动获取见 README「签到设备ID」）", st.UID)
+	} else if !s.cfg.Pool.CheckinIneligibleToday(st.UID) {
+		// 签到前兜底刷新：凌晨预刷新失败时，避免拿着过期 token 签到。
+		if a.NeedsRefresh(2 * time.Hour) {
+			if err := s.cfg.Upstream.RefreshToken(a); err != nil {
+				log.Printf("checkin refresh %s: %v", st.UID, err)
+			} else if err := a.SaveAtomic(); err != nil {
+				log.Printf("checkin refresh %s save: %v", st.UID, err)
 			}
 		}
-		if a.CheckinDeviceID == "" {
-			// 凭证缺少独立签到设备标识且本机检测不到官方客户端：多账号签到
-			// 要求各账号使用不同的设备 ID，缺字段时明确跳过并说明，不发无设备头的
-			// 无效请求，也不生成随机假 ID（上游无法识别，签到永远不会生效）。
-			log.Printf("checkin %s: skip, 缺签到设备ID且本机未检测到官方客户端（在已登录官方客户端的机器上跑 signin.sh 可自动读取并写回凭证；手动获取见 README「签到设备ID」）", st.UID)
-		} else if !s.cfg.Pool.CheckinIneligibleToday(st.UID) {
-			// 签到前兜底刷新：凌晨预刷新失败时，避免拿着过期 token 签到。
-			if a.NeedsRefresh(2 * time.Hour) {
-				if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-					log.Printf("checkin refresh %s: %v", st.UID, err)
-				} else if err := a.SaveAtomic(); err != nil {
-					log.Printf("checkin refresh %s save: %v", st.UID, err)
-				}
-			}
-			// 签到闭环：status → claim → status 复核，以复核结果为最终结论。
-			// 已签到不算失败；claim 返回 200 但复核未签上会报错（HTTP 200 业务失败不再漏判）。
-			switch err := s.cfg.Upstream.DailyCheckin(a); {
-			case err == nil:
-				log.Printf("checkin %s: ok", st.UID)
-			case errors.Is(err, upstream.ErrCheckinUnverified):
-				// claim 已发出但读回未能确认（复核未签上/读回失败）：当天
-				// 不可再领取，避免重复领取（插件 0.2.22 口径）。
+		// 签到闭环：status → claim → status 复核，以复核结果为最终结论。
+		// 已签到不算失败；claim 返回 200 但复核未签上会报错（HTTP 200 业务失败不再漏判）。
+		switch err := s.cfg.Upstream.DailyCheckin(a); {
+		case err == nil:
+			log.Printf("checkin %s: ok", st.UID)
+		case errors.Is(err, upstream.ErrCheckinUnverified):
+			// claim 已发出但读回未能确认（复核未签上/读回失败）：当天
+			// 不可再领取，避免重复领取（插件 0.2.22 口径）。
+			s.cfg.Pool.MarkCheckinIneligible(st.UID)
+			log.Printf("checkin verify uid=%s: claim 已发出但读回未确认，当天不可再领取: %v", st.UID, err)
+		case errors.Is(err, upstream.ErrAlreadyCheckedIn):
+			log.Printf("checkin %s: already checked in", st.UID)
+		case errors.Is(err, upstream.ErrCheckinDisabled):
+			log.Printf("checkin %s: disabled", st.UID)
+		default:
+			var ce *upstream.CheckinError
+			if errors.As(err, &ce) && ce.Code == upstream.CodeCheckinIneligibleDevice {
+				// 本设备今日已签：done 口径，记为当天不可领取。
 				s.cfg.Pool.MarkCheckinIneligible(st.UID)
-				log.Printf("checkin verify uid=%s: claim 已发出但读回未确认，当天不可再领取: %v", st.UID, err)
-			case errors.Is(err, upstream.ErrAlreadyCheckedIn):
-				log.Printf("checkin %s: already checked in", st.UID)
-			case errors.Is(err, upstream.ErrCheckinDisabled):
-				log.Printf("checkin %s: disabled", st.UID)
-			default:
-				var ce *upstream.CheckinError
-				if errors.As(err, &ce) && ce.Code == upstream.CodeCheckinIneligibleDevice {
-					// 本设备今日已签：done 口径，记为当天不可领取。
-					s.cfg.Pool.MarkCheckinIneligible(st.UID)
-					log.Printf("checkin %s: already checked in on this device (9095)", st.UID)
-				} else if errors.As(err, &ce) && ce.Code == upstream.CodeCheckinInAppOnly {
-					// 需在 CN app 内签：当天不再问。
-					s.cfg.Pool.MarkCheckinIneligible(st.UID)
-					log.Printf("checkin %s: ineligible, 需在 Trae CN app 内签到 (9074)", st.UID)
-				} else {
-					log.Printf("checkin %s: %v", st.UID, err)
-				}
+				log.Printf("checkin %s: already checked in on this device (9095)", st.UID)
+			} else if errors.As(err, &ce) && ce.Code == upstream.CodeCheckinInAppOnly {
+				// 需在 CN app 内签：当天不再问。
+				s.cfg.Pool.MarkCheckinIneligible(st.UID)
+				log.Printf("checkin %s: ineligible, 需在 Trae CN app 内签到 (9074)", st.UID)
+			} else {
+				log.Printf("checkin %s: %v", st.UID, err)
 			}
 		}
-		// 查积分 + 解冻（无限包账号按无限口径：credits 无意义，恒解冻）；
-		// 顺带记套餐名与最近到期（/status 展示，插件 usage.read 口径）。
-		remain, unlimited, err := s.cfg.Upstream.UserEntUsage(a)
-		if err != nil {
-			log.Printf("ent-usage %s: %v", st.UID, err)
-			continue
-		}
-		if site := s.cfg.Upstream.SiteMeta(a); site.DollarUsage {
-			if d, derr := s.cfg.Upstream.DollarEntUsage(a); derr == nil {
-				plan := d.Plan
-				if plan == "" {
-					plan = "Free"
-				}
-				s.cfg.Pool.SetUsageMeta(st.UID, plan, d.EndMs)
+	}
+	// 查积分 + 解冻（无限包账号按无限口径：credits 无意义，恒解冻）；
+	// 顺带记套餐名与最近到期（/status 展示，插件 usage.read 口径）。
+	remain, unlimited, err := s.cfg.Upstream.UserEntUsage(a)
+	if err != nil {
+		log.Printf("ent-usage %s: %v", st.UID, err)
+		return
+	}
+	if site := s.cfg.Upstream.SiteMeta(a); site.DollarUsage {
+		if d, derr := s.cfg.Upstream.DollarEntUsage(a); derr == nil {
+			plan := d.Plan
+			if plan == "" {
+				plan = "Free"
 			}
-		} else if until, uerr := s.cfg.Upstream.CreditsUntil(a); uerr == nil {
-			s.cfg.Pool.SetUsageMeta(st.UID, "Credits", until)
+			s.cfg.Pool.SetUsageMeta(st.UID, plan, d.EndMs)
 		}
-		if unlimited {
-			log.Printf("ent-usage %s: unlimited", st.UID)
-			s.cfg.Pool.ReenableUnlimited(st.UID)
-		} else {
-			log.Printf("ent-usage %s: remain=%d", st.UID, remain)
-			s.cfg.Pool.ReenableIfCredits(st.UID, remain)
-		}
+	} else if until, uerr := s.cfg.Upstream.CreditsUntil(a); uerr == nil {
+		s.cfg.Pool.SetUsageMeta(st.UID, "Credits", until)
+	}
+	if unlimited {
+		log.Printf("ent-usage %s: unlimited", st.UID)
+		s.cfg.Pool.ReenableUnlimited(st.UID)
+	} else {
+		log.Printf("ent-usage %s: remain=%d", st.UID, remain)
+		s.cfg.Pool.ReenableIfCredits(st.UID, remain)
 	}
 }
 
@@ -202,23 +226,49 @@ func (s *Scheduler) RunRefreshNow() {
 		if st.Disabled {
 			continue
 		}
-		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshTokenValue() == "" {
+		if a := s.cfg.Pool.AuthByUID(st.UID); a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
-		if !a.NeedsRefresh(s.cfg.RefreshSkew) {
-			continue
-		}
-		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-			log.Printf("refresh %s: %v", st.UID, err)
-			var ue *upstream.Error
-			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-				s.cfg.Pool.Disable(st.UID, "session dead")
-			}
-			continue
-		}
-		if err := a.SaveAtomic(); err != nil {
-			log.Printf("refresh %s save: %v", st.UID, err)
-		}
+		s.refreshAccount(st, false)
 	}
+}
+
+// RefreshOne 触发单账号刷新（admin API 用，force 忽略预刷新窗口）；
+// 账号不存在返回 false。
+func (s *Scheduler) RefreshOne(uid string) bool {
+	for _, st := range s.cfg.Pool.List() {
+		if st.UID != uid {
+			continue
+		}
+		if a := s.cfg.Pool.AuthByUID(st.UID); a == nil || a.RefreshTokenValue() == "" {
+			return false
+		}
+		return s.refreshAccount(st, true)
+	}
+	return false
+}
+
+// refreshAccount 单账号刷新；session 失效自动禁用。返回是否真正刷新。
+func (s *Scheduler) refreshAccount(st pool.Status, force bool) bool {
+	a := s.cfg.Pool.AuthByUID(st.UID)
+	if a == nil || a.RefreshTokenValue() == "" {
+		return false
+	}
+	if !force && !a.NeedsRefresh(s.cfg.RefreshSkew) {
+		return false
+	}
+	if err := s.cfg.Upstream.RefreshToken(a); err != nil {
+		log.Printf("refresh %s: %v", st.UID, err)
+		var ue *upstream.Error
+		if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+			s.cfg.Pool.Disable(st.UID, "session dead")
+		}
+		return false
+	}
+	if err := a.SaveAtomic(); err != nil {
+		log.Printf("refresh %s save: %v", st.UID, err)
+		return false
+	}
+	log.Printf("refresh %s: ok", st.UID)
+	return true
 }

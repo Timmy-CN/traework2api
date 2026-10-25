@@ -271,6 +271,19 @@ func (p *Pool) SetUsageMeta(uid, plan string, untilMs int64) {
 	p.saveLocked()
 }
 
+// Enable 解除禁用/冷却，清错误计数（admin API 启停用）。
+func (p *Pool) Enable(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.disabled = false
+		e.until = time.Time{}
+		e.reason = ""
+		e.errCount = 0
+	}
+	p.saveLocked()
+}
+
 // MarkCheckinIneligible 记录账号当天不可领取（claim 业务码 9095/9074）：
 // 当天后续轮次跳过签到，次日自动恢复。
 func (p *Pool) MarkCheckinIneligible(uid string) {

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"traework2api/internal/pool"
+	"traework2api/internal/scheduler"
 	"traework2api/internal/upstream"
 )
 
@@ -35,6 +36,9 @@ type Config struct {
 	// ShowInternalModels 在 /v1/models 透出内部模型配置
 	// （custom_model_* / *subagent* / summary）；默认过滤。
 	ShowInternalModels bool
+
+	// Scheduler 调度器（admin API 的签到/刷新触发用；nil = admin 触发端点 503）。
+	Scheduler *scheduler.Scheduler
 }
 
 // maxBodyBytes 请求体大小上限（8MB），超过返回 413。
@@ -44,6 +48,7 @@ const maxBodyBytes = 8 << 20
 type Handler struct {
 	cfg Config
 	mux *http.ServeMux
+	sch *scheduler.Scheduler
 }
 
 // NewHandler 构建 handler。
@@ -69,11 +74,12 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.DefaultModel == "" {
 		cfg.DefaultModel = upstream.DefaultConfigName
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	h := &Handler{cfg: cfg, mux: http.NewServeMux(), sch: cfg.Scheduler}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
+	h.RegisterAdmin(cfg.Scheduler)
 	return h
 }
 

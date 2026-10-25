@@ -54,6 +54,7 @@ func main() {
 	h := server.NewHandler(server.Config{
 		Pool:               p,
 		Upstream:           up,
+		Scheduler:          sch,
 		APIKey:             cfg.APIKey,
 		PlanCooldown:       cfg.PlanCreditDur,
 		SoftCooldown:       cfg.SoftRateDur,
