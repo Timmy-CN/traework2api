@@ -363,3 +363,51 @@ func TestChatStreamBodyCarriesFunction(t *testing.T) {
 		t.Errorf("body=%s", gotBody)
 	}
 }
+
+// TestEffortMediumMax 0.2.23（#434）：medium/max 两档按目录点名翻译
+// （medium→medium、max→max），仍只在条目承载时发送。
+func TestEffortMediumMax(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, batchBody(map[string][]string{
+			"chat_v3": {entry("m1", map[string]any{
+				"reasoning_effort_config": map[string]any{"options": []string{"light", "medium", "max"}},
+			})},
+		})), nil
+	})
+	infos, err := c.FetchModels(testAuth())
+	if err != nil {
+		t.Fatalf("FetchModels: %v", err)
+	}
+	var levels []string
+	for _, mi := range infos {
+		if mi.ID == "m1" {
+			levels = mi.Levels
+		}
+	}
+	want := []string{"low", "medium", "max"}
+	if len(levels) != len(want) {
+		t.Fatalf("levels=%v want %v", levels, want)
+	}
+	for i := range want {
+		if levels[i] != want[i] {
+			t.Fatalf("levels=%v want %v", levels, want)
+		}
+	}
+	// 请求带 max → 上游应收到 Trae 拼写 "max"；带 extra_high 也归 max。
+	out := PrepareBodyOpts([]byte(`{"model":"m1","messages":[],"reasoning_effort":"max"}`), ChatOpts{
+		Function: "chat_v3", Model: "m1", Levels: levels,
+	}, "", "")
+	var body map[string]any
+	_ = json.Unmarshal(out, &body)
+	if body["reasoning_effort"] != "max" {
+		t.Errorf("reasoning_effort=%v want max", body["reasoning_effort"])
+	}
+	out = PrepareBodyOpts([]byte(`{"model":"m1","messages":[],"reasoning_effort":"xhigh"}`), ChatOpts{
+		Function: "chat_v3", Model: "m1", Levels: levels,
+	}, "", "")
+	body = nil
+	_ = json.Unmarshal(out, &body)
+	if _, ok := body["reasoning_effort"]; ok {
+		t.Errorf("xhigh 不被承载，应不发送 effort，got %v", body["reasoning_effort"])
+	}
+}

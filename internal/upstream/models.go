@@ -30,8 +30,14 @@ const (
 // maxTokenLimit Max 条目的 max_tokens（__max 细目的 max_tokens）。
 const maxTokenLimit = "max_tokens"
 
-// LEVELS Trae 的 reasoning 等级 → 本插件口径（low/high/xhigh）。
-var LEVELS = map[string]string{"light": "low", "high": "high", "extra_high": "xhigh"}
+// LEVELS Trae 的 reasoning 等级 → 本插件口径。Trae 客户端 bundle 共五档
+//（reasoning_effort.{low,medium,high,extra_high,max}），0.2.23 起插件也提供
+// medium/max（#434，DeepSeek V4.1 Flash 以 max 提供）——仍只在目录条目的
+// reasoning_effort_config 点名时才发送。
+var LEVELS = map[string]string{
+	"light": "low", "medium": "medium", "high": "high",
+	"extra_high": "xhigh", "max": "max",
+}
 
 // devModelRe / maxModelRe 细目名匹配（插件 /__dev$/、/__max$/）。
 var (
