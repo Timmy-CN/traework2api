@@ -31,9 +31,11 @@ const (
 const maxTokenLimit = "max_tokens"
 
 // LEVELS Trae 的 reasoning 等级 → 本插件口径。Trae 客户端 bundle 共五档
-//（reasoning_effort.{low,medium,high,extra_high,max}），0.2.23 起插件也提供
-// medium/max（#434，DeepSeek V4.1 Flash 以 max 提供）——仍只在目录条目的
-// reasoning_effort_config 点名时才发送。
+// （reasoning_effort.{low,medium,high,extra_high,max}），0.2.23 起插件也提供
+// medium/max——仍只在目录条目的 reasoning_effort_config 点名时才发送。
+// 注意：max 是目录显式点名时的兜底映射，不是 DeepSeek V4.1 Flash 的 reasoning
+// 等级；该模型的 Max 是 <id>-max（1M 上下文）开关，见 handler 的 Max 语义。
+// 插件 0.2.24 dd260b4 已更正旧注释，但 LEVELS 仍保留 max。
 var LEVELS = map[string]string{
 	"light": "low", "medium": "medium", "high": "high",
 	"extra_high": "xhigh", "max": "max",
@@ -399,6 +401,17 @@ func ChatFunctions() []string { return chatFunctions }
 
 // FunctionOf 模型由哪个 function 列出（导出）。目录没有 → 空。
 func (c *catalog) FunctionOf(id string) string { return c.fnOf(id) }
+
+// InternalNameOf 模型的内部名（__dev/__max）；目录没有 → 空。
+func (c *catalog) InternalNameOf(id string) string {
+	if c == nil {
+		return ""
+	}
+	if e, ok := c.entries[id]; ok {
+		return e.Model.InternalName
+	}
+	return ""
+}
 
 // Has 目录是否收录该 id（导出；server 判断 REREAD_MS 重读）。
 func (c *catalog) Has(id string) bool {

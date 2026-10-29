@@ -722,6 +722,48 @@ func TestChatMaxRequestsUseBaseConfigName(t *testing.T) {
 	}
 }
 
+// TestChatKimiRewritesMoonshotToolSchema 验证 handler 把 Kimi 模型判定传到
+// ChatOpts，且上游收到的是补过 type 的 Moonshot schema（插件 0.2.24）。
+func TestChatKimiRewritesMoonshotToolSchema(t *testing.T) {
+	resetModelCache(t)
+	var bodies []map[string]any
+	ok := func() (int, string, bool) { return 200, soloSSE, true }
+	up := fakeChatCapture(t, "", map[string]func() (int, string, bool){
+		"solo_work_lite": ok,
+	}, &bodies)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{
+		"model":"kimi-k3",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"type":"function","function":{"name":"edit","parameters":{
+			"type":"object","properties":{"op":{"enum":["add","remove"]}}
+		}}}]
+	}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	b := bodies[len(bodies)-1]
+	tools := b["tools"].([]any)
+	fn := tools[0].(map[string]any)["function"].(map[string]any)
+	params, isString := fn["parameters"].(string)
+	if !isString {
+		t.Fatalf("parameters should be string, got %T", fn["parameters"])
+	}
+	var schema map[string]any
+	if err := json.Unmarshal([]byte(params), &schema); err != nil {
+		t.Fatalf("unmarshal parameters: %v", err)
+	}
+	props := schema["properties"].(map[string]any)
+	op := props["op"].(map[string]any)
+	if op["type"] != "string" {
+		t.Errorf("op.type=%v want string; schema=%s", op["type"], params)
+	}
+}
+
 // TestChatReassignsFunctionAfterFallback 回归：回退成功后目录归属更新——
 // 第二次请求直达成功的 function，不再先吃一个 4001（插件 listedBy.set）。
 func TestChatReassignsFunctionAfterFallback(t *testing.T) {

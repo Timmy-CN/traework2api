@@ -39,6 +39,9 @@ type ChatOpts struct {
 	// Levels 模型承载的 reasoning 等级（low/high/xhigh 口径）；按它翻译
 	// 请求的 reasoning_effort/reasoningEffort，条目没说不发。
 	Levels []string
+	// Moonshot 模型是否 Kimi/Moonshot（插件 moonshotModel 口径）；为 true 时
+	// tools[].function.parameters 按 Moonshot schema 规则改写。
+	Moonshot bool
 }
 
 // MaxMode 一个模型的 Max 模式。
@@ -51,7 +54,12 @@ type MaxMode struct {
 
 // PrepareBodyFn 带 function 与目录信息的改写。
 func PrepareBodyFn(src []byte, fn string, session, who string) []byte {
-	return PrepareBodyOpts(src, ChatOpts{Function: fn, Model: configNameOf(src)}, session, who)
+	model := configNameOf(src)
+	return PrepareBodyOpts(src, ChatOpts{
+		Function: fn,
+		Model:    model,
+		Moonshot: IsMoonshotModel(model),
+	}, session, who)
 }
 
 // configNameOf 取请求体里已映射好的 model 字段。
@@ -152,7 +160,8 @@ func PrepareBodyOpts(src []byte, opts ChatOpts, session, who string) []byte {
 	}
 
 	normalizeToolChoice(obj)
-	normalizeTools(obj)
+	moonshot := opts.Moonshot || IsMoonshotModel(opts.Model, configNameOf(src))
+	normalizeTools(obj, moonshot)
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return src
@@ -257,7 +266,9 @@ func normalizeToolChoice(obj map[string]any) {
 // 实测上游 Go struct: FunctionDefinition.tools[].function.parameters 是 string 类型
 // （OpenAI 标准是 object）→ 需把 parameters 对象序列化为 JSON 字符串。
 // 同时 tools 条目若不是 map 或缺 function，整体剔除（避免上游反序列化失败）。
-func normalizeTools(obj map[string]any) {
+// moonshot 为 true 时，先按插件 0.2.24 的 Moonshot schema 规则改写参数副本；
+// 请求自身的 tools 对象保持不变。
+func normalizeTools(obj map[string]any, moonshot bool) {
 	raw, present := obj["tools"]
 	if !present {
 		return
@@ -278,6 +289,10 @@ func normalizeTools(obj map[string]any) {
 		}
 		if params, ok := fn["parameters"]; ok {
 			if paramsMap, isMap := params.(map[string]any); isMap {
+				if moonshot {
+					paramsMap = cloneJSONMap(paramsMap)
+					moonshotSchema(paramsMap)
+				}
 				if s, err := json.Marshal(paramsMap); err == nil {
 					fn["parameters"] = string(s)
 				}

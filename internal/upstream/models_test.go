@@ -364,9 +364,11 @@ func TestChatStreamBodyCarriesFunction(t *testing.T) {
 	}
 }
 
-// TestEffortMediumMax 0.2.23（#434）：medium/max 两档按目录点名翻译
-// （medium→medium、max→max），仍只在条目承载时发送。
-func TestEffortMediumMax(t *testing.T) {
+// TestEffortMediumMaxFallback：medium/max 两档按目录显式点名翻译
+// （medium→medium、max→max），仍只在条目承载时发送。max 只是兜底映射，
+// 不是 DeepSeek V4.1 Flash 的 reasoning 等级；该模型的 Max 走 <id>-max
+//（1M 上下文）语义，见 handler 的 Max 测试。
+func TestEffortMediumMaxFallback(t *testing.T) {
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		return jsonResp(200, batchBody(map[string][]string{
 			"chat_v3": {entry("m1", map[string]any{

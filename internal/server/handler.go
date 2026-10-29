@@ -434,6 +434,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	sees := h.seesOf(cat, chatID)
 	levels := h.levelsOf(cat, chatID)
+	// Moonshot schema 判定（插件 moonshotModel 口径）：config/modelName/req.model
+	// 三处任一命中即可；目录不可用时 cat.InternalNameOf 返回空。
+	moonshot := upstream.IsMoonshotModel(peek.Model, configName, cat.InternalNameOf(chatID))
 
 	tried := map[string]bool{}
 	// wrongFunction 回退：同一账号先试目录 function，被 4001/4023/1005 拒时
@@ -489,6 +492,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			fnsTried[curFn] = true
 			rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body, upstream.ChatOpts{
 				Function: curFn, Model: configName, Max: max, Sees: sees, Levels: levels,
+				Moonshot: moonshot,
 			}, session, who)
 			if terr != nil {
 				lastErr = terr
